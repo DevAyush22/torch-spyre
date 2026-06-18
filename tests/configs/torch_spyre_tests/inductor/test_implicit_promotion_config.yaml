@@ -1,0 +1,94 @@
+test_suite_config:
+  files:
+    # ---- Scalar promotion tests ----
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_dtype_scalars.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - TestDatatypeScalarOperations::test_fp16_scalar_operations
+            - TestDatatypeScalarOperations::test_torch_scalar_tensor_types
+            - TestDatatypeScalarOperations::test_type_promotion_operations
+            - TestDatatypeScalarOperations::test_integer_scalar_types
+            - TestDatatypeScalarOperations::test_bool_scalar
+            - TestNegativeScalarOperations::test_int_tensor_float_scalar_promotion
+          mode: mandatory_success
+
+    # ---- Implicit roundtrip and scalar-downstream tests ----
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            # Implicit roundtrip: fp16+fp32 promotion with roundtrip validation
+            - TestOps::test_round_trip_to_dtype_implicit.*
+          mode: mandatory_success
+
+        - names:
+            # fp16 tensor op Python float scalar
+            - TestOps::test_scalar_cpu.*
+            # fp16 tensor + Python float 1.0 via Constant node
+            - TestOps::test_add_constant_cpu.*
+          mode: mandatory_success
+
+    # ---- New mixed-dtype tensor-tensor promotion tests ----
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_dtype_conversion.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            # Explicit-cast workaround for fp16+fp32 add — XFAIL #2254
+            - TestImplicitPromotion::test_working_implicit_add_fp16_to_fp32
+            # Direct fp16+fp32 add — XFAIL #2254 (arrangement mismatch)
+            - TestImplicitPromotion::test_direct_mixed_dtype_add_arrangement_error
+            # 3D aligned workaround (2,4,64)
+            - TestImplicitPromotion::test_implicit_add_fp16_3d_stick_aligned
+            # 4D/5D direct fp16+fp32 — XFAIL #2254
+            - TestImplicitPromotion::test_direct_mixed_dtype_add_4d_stick_aligned
+            - TestImplicitPromotion::test_direct_mixed_dtype_add_5d_stick_aligned
+            # Large/small value direct — XFAIL #2254
+            - TestImplicitPromotion::test_direct_mixed_dtype_add_large_values
+            - TestImplicitPromotion::test_direct_mixed_dtype_add_small_values
+            # Unaligned 2D/3D/4D workaround — XFAIL #2204
+            - TestImplicitPromotion::test_implicit_add_fp16_2d_unaligned
+            - TestImplicitPromotion::test_implicit_add_fp16_3d_unaligned
+            - TestImplicitPromotion::test_implicit_add_fp16_4d_unaligned
+            # sub/mul via explicit-cast roundtrip — XFAIL #2254
+            - TestImplicitPromotion::test_sub_fp16_fp32_via_explicit_cast_roundtrip
+            - TestImplicitPromotion::test_mul_fp16_fp32_via_explicit_cast_roundtrip
+            # Workaround: cast to fp32 first, then sum — PASS
+            - TestImplicitPromotion::test_wa_sum_fp16_explicit_fp32
+            - TestImplicitPromotion::test_wa_sum_bf16_explicit_fp32
+            # mean(fp16, dtype=fp32) — XFAIL #2205 (DL16_TO_FP32 arrangement on output)
+            - TestImplicitPromotion::test_mean_fp16_with_dtype_fp32
+            # div via explicit-cast workaround — XFAIL #2254
+            - TestImplicitPromotion::test_div_fp16_by_fp32_via_explicit_cast_workaround
+            # true_divide(fp16,fp16) always promotes to fp32
+            - TestImplicitPromotion::test_true_divide_fp16_fp16_always_promotes_to_fp32
+            # Reversed operands (fp32 first) — XFAIL #2254
+            - TestImplicitPromotion::test_direct_sub_fp32_tensor_fp16_tensor
+            # stack/cat with mixed fp16+fp32 — XFAIL #2254
+            - TestImplicitPromotion::test_stack_fp16_fp32_implicit_promotion
+            - TestImplicitPromotion::test_cat_fp16_fp32_implicit_promotion
+            # Non-contiguous tensor+tensor mixed-dtype — XFAIL #2254
+            - TestImplicitPromotion::test_implicit_tensor_add_non_contiguous_fp16_fp32
+            # XFAIL #2254: scalar '1.0' materializes as STANDARD fp32; arrangement mismatch
+            - TestImplicitPromotion::test_to_dtype_scalar_add_chain_multi_core
+          mode: mandatory_success
+
+        # Workaround validation — both inputs fp16 → both DL16_TO_FP32 → arrangement matches
+        - names:
+            - TestImplicitPromotion::test_wa_add_4d_both_fp16
+            - TestImplicitPromotion::test_wa_add_5d_both_fp16
+            - TestImplicitPromotion::test_wa_add_large_values_both_fp16
+            - TestImplicitPromotion::test_wa_add_small_values_both_fp16
+            - TestImplicitPromotion::test_wa_div_both_fp16
+            - TestImplicitPromotion::test_wa_stack_both_fp16
+            - TestImplicitPromotion::test_wa_cat_both_fp16
+          mode: mandatory_success
+
+  global:
+    supported_dtypes:
+      - name: float16
+      - name: bfloat16
+      - name: float32
+      - name: int32
+      - name: int64
+      - name: bool

@@ -1,0 +1,29 @@
+test_suite_config:
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_dtype_conversion.py
+      unlisted_test_mode: skip
+      tests:
+        # ---- Eager gate tests ----
+        - names:
+            # H2D copy of fp64 tensor raises RuntimeError
+            - TestUnsupportedGates::test_h2d_copy_fp64_raises_error
+          mode: mandatory_success
+
+        # ---- Compiled gate tests ----
+        - names:
+            # int8+fp16 implicit add raises InductorError (no to_dtype lowering for int8)
+            - TestUnsupportedGates::test_add_int8_fp16_raises_error
+          mode: mandatory_success
+
+  global:
+    supported_dtypes:
+      - name: float16
+      - name: bfloat16
+      - name: float32
+      - name: float64
+      - name: int8
+      - name: int16
+      - name: int32
+      - name: int64
+      - name: uint8
+      - name: bool

@@ -1,0 +1,56 @@
+test_suite_config:
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_dtype_conversion.py
+      unlisted_test_mode: skip
+      tests:
+        # ---- Compiled roundtrip and H2D conversion tests ----
+        - names:
+            # bf16→fp32→bf16 compiled roundtrip
+            - TestDataTransfer::test_bf16_compiled_round_trip
+            # CPU fp32 → Spyre fp16 compute → CPU fp32
+            - TestDataTransfer::test_roundtrip_cpu_fp32_spyre_fp16_cpu
+            # CPU fp16 → Spyre fp32 compute → CPU fp16
+            - TestDataTransfer::test_roundtrip_cpu_fp16_spyre_fp32_cpu
+            # CPU bf16 → Spyre fp32 compute → CPU bf16
+            - TestDataTransfer::test_roundtrip_cpu_bf16_spyre_fp32_cpu
+            # H2D copy with simultaneous dtype conversion in one call
+            - TestDataTransfer::test_h2d_with_simultaneous_dtype_conversion
+            # Same-dtype compiled copy_() — PASS
+            - TestDataTransfer::test_compiled_copy_inplace_fp16
+            # .to(t.dtype) identity as alternative to copy_() — PASS
+            - TestDataTransfer::test_compiled_copy_fp16_workaround
+            # compiled D2H fp32→fp16 in one .to('cpu', dtype=fp16) call — PASS
+            - TestDataTransfer::test_compiled_d2h_fp32_to_fp16
+          mode: mandatory_success
+
+        # ---- Eager cross-device transfer tests ----
+        - names:
+            # copy_() from fp32 CPU into fp16 Spyre with value check
+            - TestDataTransfer::test_cross_device_copy_with_dtype_coercion_value_check
+            # XFAIL #2205 #1482 #1497 — eager .float()/.half() shortcuts on Spyre tensor
+            - TestDataTransfer::test_float_half_methods_on_spyre_tensor
+          mode: mandatory_success
+
+        # ---- Eager H2D dtype quirks ----
+        - names:
+            # fp32→bool H2D succeeds — PyTorch converts dtype on CPU first, then H2D
+            - TestDataTransfer::test_h2d_fp32_to_bool_dtype_conversion
+            # int64 in-range value (42) round-trips correctly after silent downcast to int32
+            - TestDataTransfer::test_int64_in_range_value_preserved
+            # int64 out-of-range value truncates silently without crash
+            - TestDataTransfer::test_int64_out_of_range_truncates_no_exception
+            # int64 downcast warning fires at least once per session
+            - TestDataTransfer::test_int64_warning_fires_once_per_session
+          mode: mandatory_success
+
+  global:
+    supported_dtypes:
+      - name: float16
+      - name: bfloat16
+      - name: float32
+      - name: int8
+      - name: int16
+      - name: int32
+      - name: int64
+      - name: uint8
+      - name: bool

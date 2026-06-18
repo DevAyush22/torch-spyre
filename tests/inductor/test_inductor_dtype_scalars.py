@@ -817,3 +817,39 @@ class TestNegativeScalarOperations:
         assert any(
             kw in error_msg.lower() for kw in ["device", "layout", "cpu", "spyre"]
         )
+
+    def test_chained_fp16_fp32_scalar_ops(self, execution_mode):
+        """((x + s) * s) / s scalar chain promotes fp16 tensor through fp32."""
+
+        def fp16_scalar_chain(x):
+            y = x + 0.5
+            y = y * 2.0
+            return y / 4.0
+
+        x = cached_randn((4, 64))
+        _compare_modes(execution_mode, fp16_scalar_chain, x, atol=0.1, rtol=0.1)
+
+    def test_bf16_tensor_fp32_scalar_implicit_promotion(self, execution_mode):
+        """bf16 tensor + fp32 scalar implicit promotion."""
+
+        def bf16_fp32_add(x):
+            return x + 1.0
+
+        x = torch.randn(4, 64, dtype=torch.bfloat16)
+        result = _run_spyre(execution_mode, bf16_fp32_add, x)
+        expected = x + 1.0
+        assert torch.allclose(result.cpu().float(), expected.float(), atol=0.1, rtol=0.1)
+
+    def test_inplace_fp16_add_fp32_scalar_dtype_unchanged(self, execution_mode):
+        """in-place fp16 += fp32_scalar must preserve fp16 dtype."""
+
+        def inplace_add(x):
+            x += 1.0
+            return x
+
+        x = cached_randn((4, 64))
+        original_dtype = x.dtype
+        result = _run_spyre(execution_mode, inplace_add, x)
+        assert result.dtype == original_dtype, (
+            f"in-place add changed dtype: {original_dtype} -> {result.dtype}"
+        )

@@ -1,0 +1,75 @@
+test_suite_config:
+  files:
+    # ---- Generated and roundtrip variants from test_inductor_ops.py ----
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            # Generated to_dtype variants: fp16/bf16/fp32 ↔ fp16/bf16/fp32
+            - TestOps::test_to_dtype_(bfloat16|float16|float32)_to_(bfloat16|float16|float32)_.*
+            # Explicit roundtrip variants (fp16→fp32→fp16, bf16→fp32→bf16, etc.)
+            - TestOps::test_round_trip_to_dtype_(bfloat16|float16|float32)_.*
+          mode: mandatory_success
+
+    # ---- Scalar boundary and special-value tests ----
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_dtype_scalars.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - TestNegativeScalarOperations::test_fp16_overflow_underflow
+          mode: mandatory_success
+
+    # ---- New explicit conversion tests ----
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_dtype_conversion.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            # New shape variants: 2D/fp32-stick-aligned, bf16 source
+            - TestExplicitConversion::test_to_dtype_fp16_to_fp32_2d_stick_aligned
+            - TestExplicitConversion::test_to_dtype_fp16_to_fp32_fp32_stick_aligned
+            - TestExplicitConversion::test_to_dtype_bf16_to_fp32_2d_stick_aligned
+            # Unaligned shapes — to_dtype itself passes; padding failure only affects
+            # subsequent ops on the result (see unaligned xfail tests below)
+            - TestExplicitConversion::test_to_dtype_fp16_to_fp32_unaligned_4x16
+            - TestExplicitConversion::test_to_dtype_fp16_to_fp32_unaligned_4x68
+            # Chained conversion: fp16→fp32→bf16
+            - TestExplicitConversion::test_to_dtype_chain_fp16_fp32_bf16
+            # dtype preserved through neg/abs after explicit cast
+            - TestExplicitConversion::test_neg_fp16_dtype_preserved_after_explicit_cast
+            - TestExplicitConversion::test_abs_fp16_dtype_preserved
+            # Multi-core work division with SENCORES=4
+            - TestExplicitConversion::test_to_dtype_work_division_fp16_fp32_sencores4
+            # Non-contiguous layouts: transposed, expanded view (stride-2 slice skipped)
+            - TestExplicitConversion::test_to_dtype_transposed_fp16_to_fp32
+            - TestExplicitConversion::test_to_dtype_expanded_view_fp16_to_fp32
+            # .float()/.half()/.bfloat16() shortcut correctness
+            - TestExplicitConversion::test_float_shortcut_value_correctness
+            - TestExplicitConversion::test_half_shortcut_value_correctness
+            - TestExplicitConversion::test_bfloat16_shortcut_from_fp16_value_correctness
+            # XFAIL #2205: .bfloat16() from fp32 — DL16_TO_FP32 D2H readback
+            - TestExplicitConversion::test_bfloat16_shortcut_from_fp32_value_correctness
+            # NaN/Inf preserved through fp16↔fp32 roundtrip
+            - TestExplicitConversion::test_special_values_nan_inf_preserved_through_fp16_fp32_conversion
+            # Same-dtype cast compiles as identity (regression guard)
+            - TestExplicitConversion::test_same_dtype_cast_is_noop_in_compiled_graph
+            # compiled fp32→bool and D2H both work correctly (bool D2H #488 not hit here)
+            - TestExplicitConversion::test_fp32_to_bool_compiled
+            # Workaround validation: both inputs fp16 → both DL16_TO_FP32 → arrangement matches
+            - TestExplicitConversion::test_wa_exp_add_3d_stick_aligned
+            - TestExplicitConversion::test_wa_exp_sub_3d_stick_aligned
+            - TestExplicitConversion::test_wa_exp_mul_4d_stick_aligned
+            # XFAIL #2254: chained add→mul with explicit cast
+            - TestExplicitConversion::test_explicit_fp16_to_fp32_chained_add_mul_3d
+            # Workaround: non-contiguous (4,128)→(4,64) slice
+            - TestExplicitConversion::test_wa_exp_add_non_contiguous_2d
+            # XFAIL #2204: explicit cast workaround on unaligned 3D/4D shapes
+            - TestExplicitConversion::test_explicit_fp16_to_fp32_add_3d_unaligned
+            - TestExplicitConversion::test_explicit_fp16_to_fp32_add_4d_unaligned
+          mode: mandatory_success
+
+  global:
+    supported_dtypes:
+      - name: float16
+      - name: bfloat16
+      - name: float32
+      - name: bool
