@@ -31,7 +31,7 @@ from torch._inductor.ir import (
     Reduction,
 )
 from torch._inductor.scheduler import SchedulerNode
-from torch._inductor.dependencies import MemoryDep, ReadWrites
+from torch._inductor.dependencies import MemoryDep, ReadWrites, StarDep
 from torch._inductor.virtualized import V
 from torch_spyre._C import SpyreTensorLayout, get_elem_in_stick
 from torch_spyre._inductor.errors import Unsupported
@@ -128,7 +128,7 @@ def _user_min_or_none(expr: Expr) -> Optional[int]:
     return None if lower == _SHAPE_ENV_DEFAULT_LOWER else lower
 
 
-def _finite_upper_or_none(expr: Expr) -> Optional[int]:
+def finite_upper_or_none(expr: Expr) -> Optional[int]:
     """Return the ShapeEnv finite upper bound for ``expr``, or ``None``.
     A bound is usable iff it is a positive concrete
     ``sympy.Integer``; ``sympy.oo``, non-integers, and non-positive
@@ -151,11 +151,6 @@ def compute_granularity(expr: Expr, max_size: int) -> int:
     Callers must only invoke this for symbolic ``expr``. See #2284,
     #2287, #2288, #2289 for the full design.
 
-    Wiring: this helper has no call sites yet. The pointwise
-    work-division PR (#2499) will plug it into the ``size_hint`` call
-    sites in ``work_division.py`` and ``codegen/superdsc.py``,
-    alongside ``compute_max_size``.
-
     Deferred: when the symbolic dim is the stick dim of its tensor the
     granularity also needs to be a multiple of ``elems_per_stick(dtype)``.
     Handled in a follow-up once the stick-dim symbolic path is enabled.
@@ -172,7 +167,7 @@ def compute_granularity(expr: Expr, max_size: int) -> int:
     # mark_dynamic(max=...). The granularity is then only as trustworthy
     # as that hint -- warn the user so they can pin it explicitly with
     # mark_dynamic(max=...).
-    if _finite_upper_or_none(expr) is None:
+    if finite_upper_or_none(expr) is None:
         warnings.warn(
             f"max for symbolic dim {expr} came from size_hint, not from "
             f"mark_dynamic(max=...). Proceeding with max={max_size} as a "
@@ -262,9 +257,6 @@ def compute_max_size(expr: Union[Expr, int]) -> int:
     back to ``size_hint`` when no finite upper bound exists.
 
     Needed for dynamic shape support.
-
-    # TODO: To be used in size_hint call-sites in superdsc.py and work_division.py
-    #       to get the maxSize in SDSC and work planning respectively
     """
     if isinstance(expr, int):
         return expr
@@ -272,10 +264,31 @@ def compute_max_size(expr: Union[Expr, int]) -> int:
         return int(expr)
     if not (hasattr(expr, "free_symbols") and expr.free_symbols):
         return int(expr)
-    bound = _finite_upper_or_none(expr)
+    bound = finite_upper_or_none(expr)
     if bound is not None:
         return bound
     return V.graph.sizevars.size_hint(expr)
+
+
+def compute_symbolic_bounds(expr: Union[Expr, int]) -> "tuple[int, int] | None":
+    """Return (max_size, granularity) bounds for a symbolic expression from ShapeEnv.
+
+    Returns None for concrete expressions (no free symbols).
+    max_size is the computed maximum size,
+    granularity from compute_granularity.
+    """
+    if isinstance(expr, (int, sympy.Integer)):
+        return None
+    if not (hasattr(expr, "free_symbols") and expr.free_symbols):
+        return None
+    shape_env = V.graph.sizevars.shape_env
+    if shape_env is None:
+        return None
+
+    max_size = compute_max_size(expr)
+    granularity = compute_granularity(expr, max_size)
+
+    return (max_size, granularity)
 
 
 def get_mem_deps_from_rw(read_writes: ReadWrites) -> list[SchedNodeArg]:
@@ -296,7 +309,7 @@ def get_mem_deps_from_rw(read_writes: ReadWrites) -> list[SchedNodeArg]:
 def op_out_coords(op: ComputedBuffer) -> list[sympy.Expr]:
     """Return host coordinates for the output dep of a ComputedBuffer."""
     output_dep = next(iter(op.get_read_writes().writes))
-    return host_coordinates(op.get_layout(), output_dep)
+    return host_coordinates(op.get_layout(), output_dep, indirect_sizes_from_op(op))
 
 
 def _find_scatter_index_buf_names(op: ComputedBuffer) -> set[str]:
@@ -344,11 +357,41 @@ def _find_scatter_index_buf_names(op: ComputedBuffer) -> set[str]:
     return names
 
 
-def indirect_index_dep_names(op: ComputedBuffer) -> set[str]:
-    """Return names of deps whose loaded values are used as indices in loads or stores."""
-    names = {expr.base.name for expr in _build_indirect_load_subs(op).values()}
+def indirect_info_from_op(
+    op: "ComputedBuffer | None",
+) -> "tuple[set[str], dict[sympy.Symbol, sympy.Expr], dict[sympy.Symbol, int] | None]":
+    """Return (dep_names, access_subs, sizes) for a ComputedBuffer in one inner_fn pass.
+
+    Pass op=None when there is no ComputedBuffer (e.g. structural callers that only
+    check stick compatibility or layout shape). Returns (set(), {}, None), where
+    sizes=None tells compute_coordinates to skip unknown symbols silently rather than
+    raising Unsupported. None is returned when op has no indirect reads. If indirect
+    reads exist but none resolve to a known buffer (unexpected), sizes={} is returned;
+    in normalize_coordinates this still produces opaque-Term fallback (same as None),
+    but in compute_coordinates an unknown symbol would raise Unsupported.
+    """
+    if op is None:
+        return set(), {}, None
+    subs, sizes = _build_indirect_load_subs(op)
+    names: set[str] = {expr.base.name for expr in subs.values()}
     names |= _find_scatter_index_buf_names(op)
-    return names
+    access_subs = {
+        sym: IndirectAccess(sympy.Symbol(expr.base.name)) for sym, expr in subs.items()
+    }
+    return names, access_subs, sizes
+
+
+def indirect_sizes_from_op(
+    op: "ComputedBuffer | None",
+) -> "dict[sympy.Symbol, int] | None":
+    """Build {indirect_sym → size} for a ComputedBuffer (pre-scheduler).
+
+    Returns the valid index range for each indirect symbol, captured from the
+    size argument of indirect_indexing() during inner_fn re-execution.
+    Pass op=None when there is no ComputedBuffer; returns None.
+    """
+    _, _, sizes = indirect_info_from_op(op)
+    return sizes
 
 
 class _LoadSentinel:
@@ -359,12 +402,11 @@ class _LoadSentinel:
 
 
 class _IndirectIndexFinder:
-    """Re-executes inner_fn to discover which buffer's load feeds each indirect load.
+    """Re-executes inner_fn to map each indirect load to its index buffer and valid range.
 
-    load() returns a _LoadSentinel carrying the buffer name.
-    indirect_indexing() receives that sentinel and records which buffer was
-    used as the index, so the next load() call can record the relationship.
-    All other ops delegate to MockHandler.
+    Inductor bakes the index range into the inner_fn closure as the size argument to
+    ops.indirect_indexing() — invisible in printed IR, only accessible by re-execution.
+    This handler intercepts those calls to recover both the source buffer name and the size.
     """
 
     def __init__(self):
@@ -372,12 +414,21 @@ class _IndirectIndexFinder:
 
         self._mock = MockHandler()
         self._pending_indirect_index_buf: str | None = None
+        self._pending_indirect_index_size: int | None = None
         self.indirect_index_by_buf: dict[str, str] = {}
+        self.indirect_index_size_by_buf: dict[str, int] = {}
 
     def load(self, name: str, index):
         if self._pending_indirect_index_buf is not None:
+            if self._pending_indirect_index_size is None:
+                raise Unsupported(
+                    f"indirect_indexing() set pending buf {self._pending_indirect_index_buf!r} "
+                    "but did not set pending size; single-slot protocol violated"
+                )
             self.indirect_index_by_buf[name] = self._pending_indirect_index_buf
+            self.indirect_index_size_by_buf[name] = self._pending_indirect_index_size
             self._pending_indirect_index_buf = None
+            self._pending_indirect_index_size = None
         return _LoadSentinel(name)
 
     def indirect_indexing(self, index_var, size, check=True, wrap_neg=True):
@@ -385,28 +436,40 @@ class _IndirectIndexFinder:
         # lowering always emits indirect_indexing() directly before the
         # consuming load(), so the single slot is never overwritten in between.
         if isinstance(index_var, _LoadSentinel):
+            if self._pending_indirect_index_buf is not None:
+                raise Unsupported(
+                    f"indirect_indexing({index_var.name}) called before load() consumed "
+                    f"the previous pending slot ({self._pending_indirect_index_buf}); "
+                    "chained indirect indexing is not supported"
+                )
             self._pending_indirect_index_buf = index_var.name
+            self._pending_indirect_index_size = int(size)
         return sympy.S.Zero
 
     def __getattr__(self, attr):
         return getattr(self._mock, attr)
 
 
-def _find_indirect_index_bufs(op: ComputedBuffer) -> dict[str, str]:
-    """Re-execute inner_fn and return {data_buf: indirect_index_buf} mapping."""
+def _find_indirect_index_bufs(
+    op: ComputedBuffer,
+) -> "tuple[dict[str, str], dict[str, int]]":
+    """Re-execute inner_fn and return ({data_buf: index_buf}, {data_buf: size}) mappings."""
     from torch._inductor.virtualized import V as _V
 
     finder = _IndirectIndexFinder()
     with _V.set_ops_handler(finder):
         op.data.inner_fn(*op.data.inner_fn_args())
-    return finder.indirect_index_by_buf
+    return finder.indirect_index_by_buf, finder.indirect_index_size_by_buf
 
 
-def _build_indirect_load_subs(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Expr]:
-    """Map indirect symbols in MemoryDep.index to IndexedBase[source_index] exprs.
+def _build_indirect_load_subs(
+    op: ComputedBuffer,
+) -> "tuple[dict[sympy.Symbol, sympy.Expr], dict[sympy.Symbol, int] | None]":
+    """Map indirect symbols to (IndexedBase subs, sizes).
 
     Pre-scheduler only: re-executes inner_fn via _IndirectIndexFinder to learn
-    which buffer's load produced each indirect index.
+    which buffer's load produced each indirect index and what size it carries.
+    Returns ({sym: IndexedBase[...]}, {sym: size}).
     """
     from sympy import IndexedBase
 
@@ -417,10 +480,11 @@ def _build_indirect_load_subs(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Ex
         if isinstance(d, MemoryDep) and isinstance(d.index, sympy.Basic)
     ]
     if not any(d.is_indirect() for d in reads):
-        return {}
-    indirect_index_buf_map = _find_indirect_index_bufs(op)
+        return {}, None
+    indirect_index_buf_map, indirect_index_size_map = _find_indirect_index_bufs(op)
     dep_by_name = {d.name: d for d in reads}
-    result = {}
+    subs = {}
+    sizes = {}
     for d in reads:
         if not d.is_indirect():
             continue
@@ -428,12 +492,15 @@ def _build_indirect_load_subs(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Ex
         if indirect_index_buf is None:
             continue
         indirect_index_dep = dep_by_name[indirect_index_buf]
-        for sym in d.index.free_symbols:
-            if sym not in d.ranges:
-                result[sym] = IndexedBase(indirect_index_dep.name)[
-                    indirect_index_dep.index
-                ]
-    return result
+        size = indirect_index_size_map.get(d.name)
+        indirect_syms = [s for s in d.index.free_symbols if s not in d.ranges]
+        if len(indirect_syms) > 1:
+            raise Unsupported(f"multiple indirect symbols in {d.name}: {indirect_syms}")
+        for sym in indirect_syms:
+            subs[sym] = IndexedBase(indirect_index_dep.name)[indirect_index_dep.index]
+            if size is not None:
+                sizes[sym] = size
+    return subs, sizes
 
 
 def indirect_access_subs_from_op(
@@ -445,11 +512,13 @@ def indirect_access_subs_from_op(
     Re-executes inner_fn via _IndirectIndexFinder to discover which buffer's
     load produced each indirect index. The resulting subs can be passed to
     device_coordinates() to replace indirect symbols with IndirectAccess(name).
+
+    Note: internally calls indirect_info_from_op(), re-executing inner_fn. If you
+    already have the result of indirect_info_from_op(), use the access_subs field
+    directly rather than calling this function.
     """
-    raw = _build_indirect_load_subs(op)
-    return {
-        sym: IndirectAccess(sympy.Symbol(expr.base.name)) for sym, expr in raw.items()
-    }
+    _, access_subs, _ = indirect_info_from_op(op)
+    return access_subs
 
 
 def indirect_access_subs_from_kernel(
@@ -468,7 +537,23 @@ def indirect_access_subs_from_kernel(
     }
 
 
-def host_coordinates(layout: FixedLayout, dep: MemoryDep) -> list[sympy.Expr]:
+def host_coordinates(
+    layout: FixedLayout,
+    dep: MemoryDep,
+    indirect_sizes: "dict[sympy.Symbol, int] | None",
+) -> list[sympy.Expr]:
+    """Compute host-space coordinate expressions for a tensor access.
+
+    Args:
+        layout: Host layout of the tensor being accessed.
+        dep: Memory dependency describing the access index and loop ranges.
+        indirect_sizes: {indirect_sym → size} from indirect_sizes_from_op(), or
+            None for structural callers (stick-compatibility checks, layout
+            matching) where indirect coordinates are irrelevant.
+
+    Returns:
+        One coordinate expression per host dimension.
+    """
     # Concretize size/stride so compute_coordinates can use plain ``<``/``>``
     # comparisons.  var_ranges and index stay symbolic so the *output*
     # coordinate expressions remain symbolic.
@@ -477,7 +562,9 @@ def host_coordinates(layout: FixedLayout, dep: MemoryDep) -> list[sympy.Expr]:
     concrete_size = [concretize_expr(s) for s in layout.size]
     concrete_stride = [concretize_expr(s) for s in layout.stride]
     index = concretize_index(dep.index, set(dep.ranges.keys()))
-    return compute_coordinates(concrete_size, concrete_stride, dep.ranges, index)
+    return compute_coordinates(
+        concrete_size, concrete_stride, dep.ranges, index, indirect_sizes=indirect_sizes
+    )
 
 
 def identify_matmul_inputs(
@@ -589,14 +676,20 @@ def _check_stick_expr_supported(stick_expr: sympy.Expr, elems_per_stick: int) ->
 def device_coordinates(
     stl: SpyreTensorLayout,
     dep: MemoryDep,
-    indirect_load_subs: "dict[sympy.Symbol, sympy.Expr] | None" = None,
+    indirect_sizes: "dict[sympy.Symbol, int] | None",
 ) -> list[sympy.Expr]:
-    """Compute device-space coordinates for a tensor access.
+    """Compute device-space coordinate expressions for a tensor access.
 
-    indirect_load_subs: optional {indirect_sym → IndirectAccess(name)} mapping produced by
-        indirect_access_subs_from_op() (pre-scheduler) or indirect_access_subs_from_kernel()
-        (post-scheduler). When provided, indirect symbols in the coordinates are
-        replaced with IndirectAccess expressions, giving indirect-aware coordinates.
+    Args:
+        stl: Device layout (SpyreTensorLayout) of the tensor being accessed.
+        dep: Memory dependency describing the access index and loop ranges.
+        indirect_sizes: {indirect_sym → size} from indirect_sizes_from_op(), or
+            None for structural callers (stick-compatibility checks, layout
+            matching) where indirect coordinates are irrelevant.
+
+    Returns:
+        One coordinate expression per device dimension; the last element is
+        the stick expression.
     """
     # device_size and stride_map come from the C++ SpyreTensorLayout and are
     # already concrete, so no concretization is needed here.
@@ -606,10 +699,30 @@ def device_coordinates(
         stl.stride_map,
         dep.ranges,
         index,
-        indirect_load_subs,
+        indirect_sizes,
     )
     _check_stick_expr_supported(coords[-1], stl.elems_per_stick())
     return coords
+
+
+def try_device_coordinates(
+    stl: SpyreTensorLayout,
+    dep: MemoryDep,
+    indirect_sizes: "dict[sympy.Symbol, int] | None",
+) -> list[sympy.Expr] | None:
+    """Like ``device_coordinates`` but returns ``None`` instead of raising when
+    the layout's stick expression is one the backend cannot represent.
+
+    Intended for callers that *enumerate* candidate layouts (e.g. matmul input
+    layout selection) and want to skip an unrepresentable candidate rather than
+    abort the whole compile. Callers that have already committed to a single
+    layout should keep using ``device_coordinates`` so an unrepresentable stick
+    remains a hard error.
+    """
+    try:
+        return device_coordinates(stl, dep, indirect_sizes)
+    except Unsupported:
+        return None
 
 
 def iter_var_id(stick_expr) -> int:
@@ -631,8 +744,15 @@ def iteration_space(n: SchedulerNode) -> dict[sympy.Symbol, sympy.Expr]:
         # The iteration space of a Pointwise is that of its output
         return next(iter(n.read_writes.writes)).ranges.copy()
     elif isinstance(n.node.data, Reduction):
-        # The iteration space of a Reduction is that of its input
-        return next(iter(n.read_writes.reads)).ranges.copy()
+        # Output dims from the write dep; reduction dims appended from read deps.
+        result = next(iter(n.read_writes.writes)).ranges.copy()
+        for dep in n.read_writes.reads:
+            if isinstance(dep, StarDep):
+                continue
+            for sym, size in dep.ranges.items():
+                if sym not in result:
+                    result[sym] = size
+        return result
     else:
         raise Unsupported("Unexpected node type")
 
@@ -644,7 +764,15 @@ def iteration_space_from_op(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Expr
     if isinstance(op.data, Pointwise):
         return next(iter(rw.writes)).ranges.copy()
     elif isinstance(op.data, Reduction):
-        return next(iter(rw.reads)).ranges.copy()
+        # Output dims from write dep; reduction dims appended from read deps.
+        result = next(iter(rw.writes)).ranges.copy()
+        for dep in rw.reads:
+            if isinstance(dep, StarDep):
+                continue
+            for sym, size in dep.ranges.items():
+                if sym not in result:
+                    result[sym] = size
+        return result
     else:
         raise Unsupported("Unexpected node type")
 
@@ -874,17 +1002,29 @@ def compute_restickify_needed(
       (True, stl)     — restickify needed, stl is the target STL for the restickified input
       (True, None)    — restickify needed but infeasible
     """
-    if op is not None and in_dep.name in indirect_index_dep_names(op):
+    ind_names, _, ind_sizes = indirect_info_from_op(op)
+    if in_dep.name in ind_names:
         return False, None
-    idc = device_coordinates(in_stl, in_dep)
-    out_idc = device_coordinates(out_stl, out_dep)
+    idc = try_device_coordinates(in_stl, in_dep, ind_sizes)
+    out_idc = try_device_coordinates(out_stl, out_dep, ind_sizes)
+    if idc is None or out_idc is None:
+        # One of the layouts has a stick expression the backend cannot
+        # represent (e.g. floor(var/N) from a cross-stick access). Such a
+        # candidate can never be a feasible restickify source/target.
+        #
+        # Return (True, None): the (needed=True, tgt=None) pair is the
+        # "infeasible restickify" signal on this function's contract. The beam
+        # search maps it to INF cost and discards the candidate — see
+        # EdgeCostMap._compute_and_cache_cost in optimize_restickify.py. This is
+        # preferable to aborting the whole pass when another candidate is valid.
+        return True, None
     assert idc, "device_coordinates returned empty list for input"
     assert out_idc, "device_coordinates returned empty list for output"
     # Input stick with an offset always needs restickify to remove the offset.
     in_stick_offset_free = is_stick_expr_offset_free(idc[-1], in_stl.elems_per_stick())
     if in_stick_offset_free and stick_compatible([idc, out_idc]):
         return False, None
-    ic = host_coordinates(in_host, in_dep)
+    ic = host_coordinates(in_host, in_dep, ind_sizes)
     target_stick = out_idc[-1]
 
     if target_stick == sympy.S.Zero and not in_stick_offset_free:
@@ -928,6 +1068,8 @@ def replace_computed_buffer_body(
 
     Returns the replacement ComputedBuffer.
     """
+    # Always wrap the original inner_fn via WrapperHandler; never rebuild
+    # index expressions from scratch (they go stale — see issue #2797).
     new_buf = ComputedBuffer(
         name=op.get_name(),
         layout=op.layout,
@@ -1089,6 +1231,9 @@ def lower_pad_sequence(
 
     # Step 2 — identify the within-stick host dim in the view (which may include
     # phantom leading dims) by matching the within-stick element stride.
+    # TODO: replace this sm_last heuristic with _resize_device_layout from
+    # coarse_tile.py (device-native reconstruction that handles transposed and
+    # non-contiguous layouts without guessing from stride_map[-1]).
     sm_last = int(list(orig_stl.stride_map)[-1])
     orig_host_stride = list(arg_fx_node.meta["val"].stride())
     within_stick_dim_view = next(
@@ -1165,22 +1310,24 @@ def lower_pad_sequence(
 class PerCoreView:
     """Geometric description of a buffer's per-core slicing.
 
-    - work_slice_dims: (device-dim index, split factor) pairs, one per
-      split dim.
-    - core_to_slot: (device-dim index, slice-index expression in core_id)
+    - work_slice_dims: (host-dim index, (work_div_factor, tile_factor)) pairs,
+      one per split dim. Comparing both factors means two ops must agree on the
+      whole-tensor axis, its work division, AND its tiling (from spyre_hint).
+    - core_to_slot: (host-dim index, slice-index expression in core_id)
       pairs giving each core's position along that split dim.
 
-    Both fields are keyed by the buffer's device-dim index — not by op-
-    local iter symbols — so the value depends only on the buffer's
-    physical slicing.
+    Both fields are keyed by the buffer's HOST-dim index — a buffer-intrinsic,
+    frame-stable identity shared by the writer and every reader — not by op-
+    local iter symbols, so the value depends only on how the buffer is sliced,
+    not on the (logical vs tiled) frame a given dep's index happens to be in.
 
-    Example: a 2D buffer split 4-ways on dim 0 across 4 cores has
-        work_slice_dims = ((0, 4),)
+    Example: a 2D buffer split 4-ways on host dim 0 across 4 cores, untiled, has
+        work_slice_dims = ((0, (4, 1)),)
         core_to_slot    = ((0, Mod(core_id, 4)),)
-    so core_id=2 owns slot 2 along dim 0.
+    so core_id=2 owns slot 2 along host dim 0.
     """
 
-    work_slice_dims: tuple[tuple[int, int], ...]
+    work_slice_dims: tuple[tuple[int, tuple[int, int]], ...]
     core_to_slot: tuple[tuple[int, Expr], ...]
 
 
@@ -1210,22 +1357,29 @@ def _per_core_view_on_buf(
 
     Steps:
       1. Recover {iter-symbol: split} from op.op_it_space_splits.
-      2. Filter to splits that actually slice this buffer (host_stride
-         != 0 in dep.index).
-      3. Place each remaining split on a device dim via stride lookup,
-         producing work_slice_dims keyed by device-dim index.
-      4. Build the core-to-slot mapping (k_fast-aware) and re-key it
-         by device-dim so it's independent of op-local symbol names.
+      2. Map each split symbol to the HOST dim it slices, via
+         host_coordinates, producing work_slice_dims keyed by host-dim
+         index. Host-dim identity is buffer-intrinsic and frame-stable,
+         so the writer and every reader agree on it regardless of the
+         (possibly logical, possibly tiled) frame their dep index is in.
+      3. Build the core-to-slot mapping (k_fast-aware) and re-key it by
+         host-dim so it's independent of op-local symbol names.
 
     Pass an optional `cache` dict to memoize results across calls,
-    keyed by (op.op_it_space_splits, dep, buf_name).
+    keyed by (op name, op.op_it_space_splits, dep). op name is required:
+    the result also depends on op-derived write_index / read_index /
+    iter_space, so two ops sharing the same (splits, dep) — e.g. a matmul
+    producer and a pointwise consumer of the same buffer — must not alias
+    the same cache entry. buf_name is omitted because the sole caller
+    (get_ncores_for_buffers) always passes buf_name == dep.name, so the
+    frozen MemoryDep `dep` already carries it.
     """
     coeff_splits: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
     if cache is not None:
         # dicts aren't hashable; freeze each into a frozenset of items so
         # the key is hashable and order-independent.
         out, red = coeff_splits
-        key = (frozenset(out.items()), frozenset(red.items()), dep, buf_name)
+        key = (op.get_name(), frozenset(out.items()), frozenset(red.items()), dep)
         hit = cache.get(key)
         if hit is not None:
             return hit
@@ -1237,7 +1391,27 @@ def _per_core_view_on_buf(
     rw = op.get_read_writes()
     empty_view = (PerCoreView(work_slice_dims=(), core_to_slot=()), False)
     if not any(n > 1 for d in coeff_splits for n in d.values()):
-        result = empty_view
+        # Single-core (unsplit) op owns the WHOLE buffer on one core. Encode as
+        # explicit all-factor-1 dims so it does NOT alias the broadcast empty_view
+        # a multi-core op yields when its splits all contract on this buffer (Step
+        # 2). Otherwise a 1-core producer and its 32-core consumers compare equal,
+        # the buffer is sized per-consumer-core (under-counted), and a too-large
+        # buffer gets wrongly LX-pinned. Real sliced views always carry a factor>1.
+        buf_layout = V.graph.get_buffer(buf_name).layout
+        if not isinstance(buf_layout, FixedTiledLayout):
+            result = empty_view
+        else:
+            # Key by host-dim count to match the multi-core path (which keys
+            # work_slice_dims by host-dim index). Explicit all-(work=1,tile=1)
+            # dims so a single-core view never aliases the broadcast empty_view.
+            ndims = len(buf_layout.size)
+            result = (
+                PerCoreView(
+                    work_slice_dims=tuple((i, (1, 1)) for i in range(ndims)),
+                    core_to_slot=(),
+                ),
+                False,
+            )
         if cache is not None:
             cache[key] = result
         return result
@@ -1248,114 +1422,80 @@ def _per_core_view_on_buf(
         coeff_splits, write_index, read_index, iter_space
     )
 
-    # Step 2: keep splits that actually slice this buffer, keyed by
-    # their host stride on buf via dep.index.coeff(sym). host_stride == 0
-    # means the split contracts an axis not present on this buffer
-    # (canonical case: a K-split's output dep) and is dropped from the
-    # geometry. The has_partial_reduction flag is op-level — set whenever
-    # the op has any reduction-axis split — and is independent of which
-    # dep we're inspecting here.
+    # Step 2: map each split symbol to the HOST dim it slices, via
+    # host_coordinates. The per-core view is keyed by host-dim index — a
+    # frame-stable, buffer-intrinsic identity shared by all users of the buffer
+    # (the writer and every reader index the same host dims). This avoids the
+    # logical-vs-physical device-stride ambiguity: deps reach the allocator in
+    # mixed frames (some logical, some partially tiled), but host_coordinates
+    # interprets each dep's index against the buffer's host layout, giving the
+    # same host-dim answer regardless. A size-1 host dim is never a split key —
+    # no loop var indexes it (compute_coordinates skips size-1 dims). The
+    # has_partial_reduction flag is op-level — set whenever the op has any
+    # reduction-axis split — independent of which dep we inspect.
     has_partial_reduction = any(n > 1 for n in coeff_splits[1].values())
-    splits_by_stride: dict[int, tuple[int, "sympy.Symbol"]] = {}
-    for sym, split in per_sym.items():
-        host_stride = concretize_expr(dep.index.coeff(sym))
-        if split <= 1 or host_stride == 0:
-            continue
-        splits_by_stride[host_stride] = (int(split), sym)
 
-    buf_layout = V.graph.get_buffer(buf_name).layout
+    buf_op = V.graph.get_buffer(buf_name)
+    buf_layout = buf_op.layout
     if not isinstance(buf_layout, FixedTiledLayout):
         return empty_view
-    dev_layout = buf_layout.device_layout
-    device_size = dev_layout.device_size
-    stride_map = dev_layout.stride_map
-    elems_per_stick = dev_layout.device_dtype.elems_per_stick()
-
-    # Step 3: place each split on a device dim via stride lookup.
-    #
-    # stride_map[i] is a device-dim → host-stride mapping. The stickified
-    # host dim decomposes into two device dims (per dim_map_to_stride_map in C++):
-    #   - within-stick dim: always at position n-1, with
-    #     stride_map[-1] = host_stride[stick_dim] and dev_size = elems_per_stick.
-    #   - outer-stick (num_stick) dim: stride = stride_map[-1] * elems_per_stick,
-    #     dev_size = ceil(host_size[stick_dim] / elems_per_stick).
-    # A split whose host stride h equals stick_host_stride lands on the
-    # stickified host dim; sticks are atomic, so it must use the outer-stick
-    # dim. Skip stride_map entries <= 0 — sentinels for collapsed or
-    # broadcast dims.
-    #
-    # Example: host [64, 128] sticked to device [2, 64, 64] with
-    # stride_map=[64, 128, 1] and elems_per_stick=64. stick_host_stride=1,
-    # num_stick_dim=dim 0 (stride 64). With M-split×4 (h=128) and N-split×2
-    # (h=1), N's h matches stick_host_stride → outer-stick dim 0; M's h=128
-    # → dim 1. Result: work_slice_dims={0: 2, 1: 4}.
-    device_stride_to_dim: dict[int, int] = {}
-    for i, s in enumerate(stride_map):
-        if s <= 0:
+    ind_sizes = indirect_sizes_from_op(op)
+    # Guard: if dep.index contains an indirect symbol not covered by ind_sizes,
+    # host_coordinates would raise Unsupported. Fall back to empty_view so the
+    # buffer is conservatively kept off LX.
+    if ind_sizes is not None:
+        loop_vars = set(iteration_space_from_op(op).keys())
+        if not dep.index.free_symbols.issubset(loop_vars | ind_sizes.keys()):
+            return empty_view
+    host_coords = host_coordinates(buf_layout, dep, ind_sizes)
+    # host dim index -> the unique loop var whose coord expression covers it.
+    # (compute_coordinates yields one coord expr per host dim; a split var
+    # appears in exactly the host dim it strides.)
+    # Per-loop-var tile factor from op.dim_hints (spyre_hint). A loop var may
+    # carry several hint entries (e.g. a fused B/H axis: B split_count=1,
+    # H split_count=8) — the tile factor is their product (size-1 dims
+    # contribute ×1). Absent / untiled loop var → factor 1.
+    # Fall back to the producer's dim_hints when op has none (e.g. combine/fill
+    # inserted by _maybe_coarse_tile after assign_dim_hints ran).
+    # TODO: fix in coarse_tile.py — _insert_combine_op/_insert_reduction_copy_op
+    # /fill path should copy dim_hints from the tiled op onto inserted ops.
+    dim_hints = getattr(op, "dim_hints", None) or getattr(buf_op, "dim_hints", None)
+    tile_by_sym: dict = {}
+    for h in dim_hints or ():
+        if h.is_reduction or h.loop_var is None:
             continue
-        prev = device_stride_to_dim.get(s)
-        if prev is None or device_size[i] != 1:
-            device_stride_to_dim[s] = i
+        tile_by_sym[h.loop_var] = tile_by_sym.get(h.loop_var, 1) * int(h.split_count)
 
-    stick_host_stride, num_stick_dim, num_stick, num_stick_stride = None, None, 0, 0
-    if stride_map[-1] > 0:
-        stick_host_stride = stride_map[-1]
-        num_stick_dim = device_stride_to_dim.get(stick_host_stride * elems_per_stick)
-        if num_stick_dim is not None:
-            num_stick = device_size[num_stick_dim]
-            num_stick_stride = stride_map[num_stick_dim]
-
-    work_slice_dims: dict[int, int] = {}
-    sym_to_device_dim: dict["sympy.Symbol", int] = {}
-    for h, (split, sym) in sorted(splits_by_stride.items()):
-        dev_dim = device_stride_to_dim.get(h)
-        if h == stick_host_stride:
-            dev_dim = num_stick_dim
-        # Multi-stick-stride rescue: a consumer view subdivides the stickified
-        # axis at k sticks per step (h = k * num_stick_stride). Only safe when
-        # split*k fully covers num_stick_dim — partial coverage would
-        # misreport the per-dim factor. Example (test_view_unsqueeze_add):
-        # device_size=[2, 6, 1, 64], num_stick_dim=1 (stride 64); split=3,
-        # h=128, k=2, split*k=6 == device_size[1] → place on dim 1, factor 6.
-        if dev_dim is None and num_stick_stride > 0 and h % num_stick_stride == 0:
-            k = h // num_stick_stride
-            if split * k == num_stick:
-                dev_dim = num_stick_dim
-                split *= k
-        # TODO: two known unhandled failure modes fall through to the
-        # empty_view fallback (cases catalogued in
-        # per_core_view_failing_cases.md):
-        #   (A) Collapsed-axis info loss — device_layout built from a
-        #       higher-rank host tensor while dep is indexed via a lower-rank
-        #       reshape view; the work-split factor spans multiple device
-        #       dims but reaches us as a single (h, factor) (e.g.
-        #       test_matmul_tiled_y, test_qkv_attn_paths_fms_*_gqa).
-        #   (B) Multi-stick stride with partial coverage —
-        #       h = k * stride_map[num_stick_dim], k > 1, but
-        #       split * k < num_stick (rescue above only
-        #       handles the full-coverage case where they are equal).
-        # In both cases no single (dev_dim, factor) placement faithfully
-        # represents the per-core slicing; empty_view keeps the buffer on
-        # HBM via the caller's mismatch logic. Future work: extend the
-        # PerCoreView schema to express multi-dim or strided splits, or
-        # refuse the buffer earlier in scratchpad planning.
-        if (
-            dev_dim is None
-            or dev_dim in work_slice_dims
-            or device_size[dev_dim] % split != 0
-        ):
+    # host dim index -> the unique loop var whose coord expression covers it.
+    # (compute_coordinates yields one coord expr per host dim; a split var
+    # appears in exactly the host dim it strides.) work_slice_dims stores
+    # (work_div_factor, tile_factor) per host dim: comparing both means two ops
+    # must agree on the whole-tensor axis, its work division, AND its tiling.
+    sym_to_host_dim: dict["sympy.Symbol", int] = {}
+    work_slice_dims: dict[int, tuple[int, int]] = {}
+    for sym, split in per_sym.items():
+        if split <= 1:
+            continue
+        dims = [i for i, c in enumerate(host_coords) if sym in c.free_symbols]
+        # A split axis must map to exactly one host dim. Zero dims means the
+        # split contracts an axis absent from this buffer (e.g. a K-split's
+        # output dep) — drop it. More than one host dim (a split spanning
+        # multiple host dims via a reshape/fold) can't be faithfully keyed by a
+        # single host-dim index; fail closed to empty_view (buffer stays HBM).
+        if len(dims) == 0:
+            continue
+        if len(dims) > 1 or dims[0] in work_slice_dims:
             logger.debug(
-                f"could not place split h={h} factor={split} on "
-                f"stride_map={stride_map} device_size={device_size}; "
-                f"returning empty_view"
+                f"could not place split {sym} factor={split} on host_coords="
+                f"{host_coords}; returning empty_view"
             )
             return empty_view
-        work_slice_dims[dev_dim] = split
-        sym_to_device_dim[sym] = dev_dim
+        work_slice_dims[dims[0]] = (int(split), tile_by_sym.get(sym, 1))
+        sym_to_host_dim[sym] = dims[0]
 
-    # Step 4: build the core→slot mapping using the same gate codegen
-    # uses (_should_use_k_fast_mapping), so K-fast matmul ops compare
-    # under the K-cohort-adjacent ordering they will actually emit.
+    # Step 3: build the core→slot mapping using the same gate codegen uses
+    # (_should_use_k_fast_mapping), so K-fast matmul ops compare under the
+    # K-cohort-adjacent ordering they will actually emit.
     num_cores = int(math.prod(per_sym.values()))
     is_matmul = _is_matmul_op(op)
     if _should_use_k_fast_mapping(is_matmul, iter_space, per_sym):
@@ -1363,18 +1503,14 @@ def _per_core_view_on_buf(
     else:
         _mapping_func = _get_core_to_slice_mapping
     core_to_slot_by_name = _mapping_func(iter_space, per_sym, num_cores)
-    # Re-key by the buffer's device-dim index (canonical) instead of the op's
-    # iter symbol name. Two ops with the same physical per-core slicing on
-    # this buffer compare equal even if they name their iter axes differently
-    # (e.g. one op calls cols `d0`, another calls cols `d1`). Drop unsplit
-    # dims: _get_core_to_slice_mapping emits Integer(0) for any dim with
-    # split=1, which doesn't affect per-core byte placement but would make
-    # two ops with different iter-space arities compare unequal.
+    # Re-key by the buffer's host-dim index (canonical) instead of the op's
+    # iter symbol name. Two ops with the same per-core slicing on this buffer
+    # compare equal even if they name their iter axes differently.
     pruned_core_to_slot: list[tuple[int, "Expr"]] = []
-    for sym, dev_dim in sym_to_device_dim.items():
+    for sym, host_dim in sym_to_host_dim.items():
         expr = core_to_slot_by_name.get(str(sym))
         if expr is not None:
-            pruned_core_to_slot.append((dev_dim, expr))
+            pruned_core_to_slot.append((host_dim, expr))
     pruned_core_to_slot.sort(key=lambda x: x[0])
 
     view = PerCoreView(

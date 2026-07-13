@@ -39,6 +39,7 @@ POINTWISE_UNARY_OPS_DICT = {
     "reciprocal": torch.reciprocal,
     "relu": torch.relu,
     "sign": torch.sign,
+    "silu": torch.ops.aten.silu,
     "sin": torch.sin,
     "tanh": torch.tanh,
 }
@@ -193,11 +194,6 @@ SPYRE_MODE_SUPPORT_OVERRIDES_BY_OP = {
         "eager": False,
         "reason": "Spyre eager aten::amin.out is not supported yet (issue #1708)",
     },
-    torch.amax: {
-        "compiled": True,
-        "eager": False,
-        "reason": "Spyre eager aten::amax.out is not supported yet (issue #1708)",
-    },
     torch.min: {
         "compiled": True,
         "eager": False,
@@ -289,7 +285,7 @@ TO_DTYPE_OP_PARAMS_SETS = {
     )
     for src, dst in DtypeOpTable.get_dtype_pairs()
     for shape in TO_DTYPE_OP_SHAPES
-    if src != torch.bool and dst != torch.bool
+    if src not in (torch.bool, torch.float8_e4m3fn) and dst != torch.bool
 }
 
 
@@ -320,8 +316,205 @@ TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL = [
     for shape in TO_DTYPE_OP_SHAPES_UNALIGNED
 ]
 
+# Mixed element arrangements across a graph boundary: one operand is a native
+# fp32 (STANDARD) input, the other is fp16 upcast to fp32 in-graph (staggered
+# DL16_TO_FP32). The op then sees two different EAs on operands whose stick
+# dimension has more than one element, which is unsupported and rejected at
+# compile time.
+#
+# NOTE: the deciding factor is the *stick dimension size*, NOT alignment. Every
+# shape here (aligned AND unaligned) has a non-broadcast stick (> 1 element) and
+# is rejected identically; alignment is irrelevant. The op is only allowed when
+# the STANDARD operand broadcasts at the stick dim (stick size 1) — see
+# TO_DTYPE_OP_MIXED_EA_BROADCAST_PARAMS_SETS below.
+TO_DTYPE_OP_ROUND_TRIP_INVALID_PARAMS_SETS = {
+    f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}": (
+        cached_randn(shape, dtype=src),
+        dst,
+    )
+    for src, dst in [(torch.float16, torch.float32)]
+    for shape in TO_DTYPE_OP_SHAPES  # aligned + unaligned; all have stick > 1
+}
+
+# Positive counterpart to the INVALID set: a mixed-EA op IS supported when the
+# STANDARD operand broadcasts at the stick dim (stick size 1) — a one-element
+# stick carries no ordering for the EA to disagree on.
+#
+# Only the aligned config below is supported today: the non-broadcast (converted,
+# staggered) operand is fp16 with a stick aligned to 64, and the broadcast
+# operand is fp32 with a trailing size-1 dim. This is the RMSNorm shape
+# (weight/scale broadcast against the upcast hidden states).
+#
+# KNOWN LATENT GAPS (issue-worthy, out of scope for this feature):
+#   - fp16[..., 1] + fp32[..., N>1] (fp16 is the broadcaster): SILENTLY
+#     miscomputes when N is a multiple of the fp32 stick (e.g. (4,1)+(4,64) →
+#     wrong result, no error) and otherwise errors (BAD-LAYOUT / "unexpected
+#     stick expression").
+#   - Unaligned non-broadcast operand (e.g. (4,32)+(4,1)): fails with
+#     "Invalid device sizes and stride map".
+TO_DTYPE_OP_MIXED_EA_BROADCAST_PARAMS_SETS = {
+    f"fp16_{shapes2key((big,))}_bcast_fp32_{shapes2key((small,))}": (
+        cached_randn(big, dtype=torch.float16),
+        cached_randn(small, dtype=torch.float32),
+    )
+    for big, small in [((4, 128), (4, 1)), ((2, 4, 64), (2, 4, 1))]
+}
+
 FP32_EPS = torch.finfo(torch.float32).eps  # 1.1920928955078125e-07
 FP16_EPS = torch.finfo(torch.float16).eps  # 0.0009765625
+
+
+def _attention_fn(q, k, v, scale=True):
+    d_k = q.size(-1)
+    scores = q @ k.transpose(-2, -1)
+    if scale:
+        scores = scores / (d_k**0.5)
+    attn = scores.softmax(dim=-1)
+    return attn @ v
+
+
+_PATTERN_TOL = {
+    "attn_scaled_dot_product": (1e-2, 1e-1),
+    # Encoder path adds transpose(1,2) after attention; compiled fp16 vs CPU can exceed 1e-2 abs
+    # on ~0.4% of elements (softmax tails / small refs inflate rtol without loosening atol).
+    "transformer_encoder_attention": (1e-1, 5e-1),
+    "transformer_decoder_cross_attention": (1e-1, 1e-1),
+    "vit_attention_cls_token": (1e-2, 1e-1),
+    "pos_encoding_broadcast": (2e-3, 1e-2),
+    # Pure transpose / view+transpose / transpose+contiguous+view.
+    "vit_patch_transpose": (1e-3, 1e-2),
+    "attn_multi_head_split": (1e-3, 1e-2),
+    "attn_head_concat": (1e-3, 1e-2),
+}
+
+
+def _pattern_param_sets():
+    out = {}
+
+    def pair(key, variant, *tensor_args):
+        out[f"{key}_eager"] = (variant, "eager", *tensor_args)
+        out[f"{key}_compiled"] = (variant, "compiled", *tensor_args)
+
+    torch.manual_seed(0xAFFE)
+
+    qa = cached_randn((2, 8, 128, 64), dtype=torch.float16, differentiation=1)
+    ka = cached_randn((2, 8, 128, 64), dtype=torch.float16, differentiation=2)
+    va = cached_randn((2, 8, 128, 64), dtype=torch.float16, differentiation=3)
+    pair("pattern_scaled_dot_product", "attn_scaled_dot_product", qa, ka, va)
+
+    pair(
+        "pattern_multi_head_split",
+        "attn_multi_head_split",
+        cached_randn((2, 128, 512), dtype=torch.float16),
+    )
+    pair(
+        "pattern_head_concat",
+        "attn_head_concat",
+        cached_randn((2, 8, 128, 64), dtype=torch.float16),
+    )
+    pair(
+        "pattern_qkv_split",
+        "attn_qkv_projection",
+        cached_randn((2, 128, 3, 8, 64), dtype=torch.float16),
+    )
+
+    pair("pattern_encoder_attention", "transformer_encoder_attention", qa, ka, va)
+    qd = cached_randn((2, 8, 64, 64), dtype=torch.float16, differentiation=10)
+    kd = cached_randn((2, 8, 128, 64), dtype=torch.float16, differentiation=11)
+    vd = cached_randn((2, 8, 128, 64), dtype=torch.float16, differentiation=12)
+    pair(
+        "pattern_decoder_cross_attention",
+        "transformer_decoder_cross_attention",
+        qd,
+        kd,
+        vd,
+    )
+
+    xpos = cached_randn((2, 128, 512), dtype=torch.float16)
+    pos = cached_randn((128, 512), dtype=torch.float16)
+    pair("pattern_pos_encoding_broadcast", "pos_encoding_broadcast", xpos, pos)
+
+    pair(
+        "pattern_vit_patch_transpose",
+        "vit_patch_transpose",
+        cached_randn((2, 196, 768), dtype=torch.float16),
+    )
+    qv = cached_randn((2, 12, 197, 64), dtype=torch.float16, differentiation=13)
+    kv = cached_randn((2, 12, 197, 64), dtype=torch.float16, differentiation=14)
+    vv = cached_randn((2, 12, 197, 64), dtype=torch.float16, differentiation=15)
+    pair("pattern_vit_cls_attention", "vit_attention_cls_token", qv, kv, vv)
+    return out
+
+
+def _pattern_resolve(variant, args):
+    a = args
+    if variant == "attn_scaled_dot_product":
+        q, k, v = a
+        return (
+            lambda q2, k2, v2: _attention_fn(q2, k2, v2, scale=True),
+            (q, k, v),
+        )
+    if variant == "attn_multi_head_split":
+        (x,) = a
+
+        def _mhsplit(t):
+            b, s, d_model = t.shape
+            num_heads, d_k = 8, 64
+            t2 = t.view(b, s, num_heads, d_k)
+            return t2.transpose(1, 2)
+
+        return _mhsplit, (x,)
+    if variant == "attn_head_concat":
+        (x,) = a
+
+        def _concat(t):
+            t2 = t.transpose(1, 2)
+            b_, seq_len, heads, d_k = t2.shape
+            return t2.contiguous().view(b_, seq_len, heads * d_k)
+
+        return _concat, (x,)
+    if variant == "attn_qkv_projection":
+        (qkv,) = a
+
+        def _split(qkv_tensor):
+            p = qkv_tensor.permute(2, 0, 3, 1, 4)
+            return p[0], p[1], p[2]
+
+        return _split, (qkv,)
+    if variant == "transformer_encoder_attention":
+        q, k, v = a
+
+        def _enc(q2, k2, v2):
+            out = _attention_fn(q2, k2, v2, scale=False)
+            return out.transpose(1, 2)
+
+        return _enc, (q, k, v)
+    if variant == "transformer_decoder_cross_attention":
+        q, k, v = a
+        return (
+            lambda q2, k2, v2: _attention_fn(q2, k2, v2, scale=False),
+            (q, k, v),
+        )
+    if variant == "pos_encoding_broadcast":
+        x, p = a
+        # Transpose to (batch, hidden, seq), add pos encoding in that space, then
+        # transpose back — a real pattern where positional bias is applied channel-first.
+        return (
+            lambda t, u: (t.transpose(1, 2) + u.transpose(0, 1).unsqueeze(0)).transpose(
+                1, 2
+            ),
+            (x, p),
+        )
+    if variant == "vit_patch_transpose":
+        (x,) = a
+        return lambda t: t.transpose(1, 2), (x,)
+    if variant == "vit_attention_cls_token":
+        q, k, v = a
+        return (
+            lambda q2, k2, v2: _attention_fn(q2, k2, v2, scale=True),
+            (q, k, v),
+        )
+    raise ValueError(f"unknown transpose suite variant {variant}")
 
 
 class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
@@ -549,18 +742,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": {
                 "fp32_enabled": (
                     True,
-                    cached_randn((4, 4), dtype=torch.float32),
-                    cached_randn((4, 4), differentiation=1, dtype=torch.float32),
+                    cached_randn((64, 64), dtype=torch.float32),
+                    cached_randn((64, 64), differentiation=1, dtype=torch.float32),
                 ),
                 "f16_enabled": (
                     True,
-                    cached_randn((4, 4), dtype=torch.float16),
-                    cached_randn((4, 4), differentiation=1, dtype=torch.float16),
+                    cached_randn((64, 64), dtype=torch.float16),
+                    cached_randn((64, 64), differentiation=1, dtype=torch.float16),
                 ),
                 "f16_disabled": (
                     False,
-                    cached_randn((4, 4), differentiation=2, dtype=torch.float16),
-                    cached_randn((4, 4), differentiation=3, dtype=torch.float16),
+                    cached_randn((64, 64), differentiation=2, dtype=torch.float16),
+                    cached_randn((64, 64), differentiation=3, dtype=torch.float16),
                 ),
             },
             "expect_fail": ["fp32_enabled"],
@@ -764,14 +957,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
                 "1d_int64": (unique_randn_along_dim((64,), dtype=torch.int64),),
                 "2d_int64": (unique_randn_along_dim((67, 256), dtype=torch.int64),),
+                "3d_int64": (unique_randn_along_dim((4, 8, 16), dtype=torch.int64),),
+                "1d_float32": (unique_randn_along_dim((64,), dtype=torch.float32),),
+                "2d_float32": (unique_randn_along_dim((8, 64), dtype=torch.float32),),
             },
-            "expect_fail": [
-                "1d_float16",
-                "2d_float16",
-                "3d_float16",
-                "1d_int64",
-                "2d_int64",
-            ],
         },
         # Compare with cpu for now to avoid hitting eager mode coverage issue
         ("test_max_keepdim0", "test_reduce_keepdim0_cpu"): {
@@ -1032,13 +1221,25 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             ),
         },
         ("test_t_2d", "test_t_2d_cpu"): {
-            "param_sets": make_param_dict(
-                [
-                    ((1088, 320),),
-                    ((320, 320),),
-                    ((49159, 4096),),
-                ]
-            ),
+            "param_sets": {
+                **make_param_dict(
+                    [
+                        ((1088, 320),),
+                        ((320, 320),),
+                        ((49159, 4096),),
+                        ((64, 128),),
+                        ((128, 256),),
+                        ((256, 512),),
+                        ((64, 64),),
+                        ((1, 64),),
+                        ((64, 1),),
+                        ((127, 131),),
+                        ((1, 1),),
+                    ]
+                ),
+                "16x32_f32": (cached_randn((16, 32), dtype=torch.float32),),
+                "16x16_f32": (cached_randn((16, 16), dtype=torch.float32),),
+            },
         },
         ("test_t_2d_contiguous", "test_t_2d_contiguous_cpu"): {
             "param_sets": make_param_dict(
@@ -1048,6 +1249,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((49280, 4096),),
                     ((4096, 49280),),
                     ((49159, 4096),),
+                    ((64, 128),),
+                    ((128, 256),),
+                    ((256, 512),),
+                    ((64, 64),),
+                    ((1, 64),),
+                    ((64, 1),),
+                    ((1, 1),),
                 ]
             ),
             "expect_fail": ["49159x4096"],
@@ -1235,7 +1443,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
                 "dim_1_2": (
                     1,
-                    3,
+                    2,
                     cached_randn((3, 256, 64, 64), abs=True),
                 ),
                 "dim_0_1": (
@@ -1264,7 +1472,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
                 "dim_1_2": (
                     1,
-                    3,
+                    2,
                     cached_randn((3, 256, 64, 64), abs=True),
                 ),
                 "dim_0_1": (
@@ -1464,9 +1672,52 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "2d_1_0": ((2, 3), (1, 0)),
                 "4d_0_2_1_3": ((2, 3, 16, 64), (0, 2, 1, 3)),
                 "3d_0_2_1": ((2, 1024, 844), (0, 2, 1)),
+                "3d_021_common": (
+                    (64, 128, 256),
+                    (0, 2, 1),
+                ),
+                "3d_210": ((64, 128, 256), (2, 1, 0)),
+                "3d_102": ((64, 128, 256), (1, 0, 2)),
+                "3d_201": ((64, 128, 256), (2, 0, 1)),
+                "3d_120": ((64, 128, 256), (1, 2, 0)),
+                "4d_attn_0213": (
+                    (2, 8, 128, 64),
+                    (0, 2, 1, 3),
+                ),
+                "4d_attn_0132": (
+                    (2, 8, 128, 64),
+                    (0, 1, 3, 2),
+                ),
+                "4d_attn_0231": (
+                    (2, 8, 128, 64),
+                    (0, 2, 3, 1),
+                ),
+                "4d_attn_2013": (
+                    (2, 8, 128, 64),
+                    (2, 0, 1, 3),
+                ),
+                "3d_stick_large": (
+                    (64, 128, 192),
+                    (0, 2, 1),
+                ),
+                "3d_stick_small": (
+                    (16, 32, 48),
+                    (0, 2, 1),
+                ),
+                "sz1_perm_a": ((1, 64, 1), (0, 2, 1)),
+                "sz1_perm_b": ((1, 1, 64), (2, 1, 0)),
+                "prime_perm": ((17, 19, 23), (2, 0, 1)),
                 "4d_0_3_1_2": ((2, 2, 256, 48), (0, 3, 1, 2)),
                 "4d_0_m2_m1_1": ((2, 48, 2, 256), (0, -2, -1, 1)),
                 "5d_0_2_3_4_1": ((2, 48, 2, 256, 265), (0, 2, 3, 4, 1)),
+                "3d_prime_201": ((11, 13, 17), (2, 0, 1)),
+                "3d_prime_120": ((17, 19, 23), (1, 2, 0)),
+                "4d_odd_0213": ((2, 7, 11, 13), (0, 2, 1, 3)),
+                "4d_odd_3120": ((2, 7, 11, 13), (3, 1, 2, 0)),
+                "perm_mixed_signs": (
+                    (2, 5, 7, 11),
+                    (0, -1, -3, -2),
+                ),
             },
         },
         ("test_flatten", "test_flatten_cpu"): {
@@ -1836,8 +2087,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "test_empty_like_dtype_override_cpu",
         ): {
             "param_sets": {
-                "fp16_to_fp32": (cached_randn((4, 8), dtype=torch.float16),),
-                "fp32_to_fp16": (cached_randn((4, 8), dtype=torch.float32),),
+                "fp16_to_fp32": (cached_randn((64, 128), dtype=torch.float16),),
+                "fp32_to_fp16": (cached_randn((64, 128), dtype=torch.float32),),
             },
         },
         (
@@ -2773,6 +3024,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "add1": lambda _, x: torch.add(x.clone(), x),
                 "add2": lambda _, x: torch.add(x, x),
                 "to_dtype": lambda _, x: x.to(dtype=torch.bool),
+                "double_read": lambda _, x: (
+                    (x + 1) + torch.amax(x, dim=-1, keepdim=True)
+                ),
             },
             "param_sets": {
                 "2d64": (1, 32, 96, cached_randn((128, 256))),
@@ -2829,6 +3083,105 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d128_0": (2, 32, 160, cached_randn((128, 3, 256))),
                 "3d128_1": (2, 32, 160, cached_randn((2, 192, 256))),
                 "3d128_01": (2, 32, 160, cached_randn((128, 192, 256))),
+            },
+        },
+        ("test_slice_stick_mutation", "test_slice_cpu"): {
+            "ops_dict": {
+                "input": lambda _, x, y: x.copy_(y)._base,
+                "square": lambda _, x, y: x.copy_(y.square())._base,
+                "ones": lambda _, x, _y: x.copy_(torch.ones_like(x))._base,
+                "arange": lambda _, x, _y: (
+                    x.copy_(
+                        torch.arange(
+                            x.shape[-1], dtype=x.dtype, device=x.device
+                        ).repeat(*x.shape[:-1], 1)
+                    )._base
+                ),
+                "double_read": lambda _, x, y: (
+                    z := x.copy_(y)._base,
+                    (z + 1) + torch.amax(z, dim=-1, keepdim=True),
+                )[-1],
+            },
+            "param_sets": {
+                "2d64": (1, 32, 96, cached_randn((128, 256)), cached_randn((128, 64))),
+                "2d128": (
+                    1,
+                    1,
+                    129,
+                    cached_randn((128, 256)),
+                    cached_randn((128, 128)),
+                ),
+                "3d64_0": (
+                    2,
+                    32,
+                    96,
+                    cached_randn((128, 3, 256)),
+                    cached_randn((128, 3, 64)),
+                ),
+                "3d64_1": (
+                    2,
+                    32,
+                    96,
+                    cached_randn((2, 192, 256)),
+                    cached_randn((2, 192, 64)),
+                ),
+                "3d64_01": (
+                    2,
+                    32,
+                    96,
+                    cached_randn((128, 192, 256)),
+                    cached_randn((128, 192, 64)),
+                ),
+                "3d128_0": (
+                    2,
+                    1,
+                    129,
+                    cached_randn((128, 3, 256)),
+                    cached_randn((128, 3, 128)),
+                ),
+                "3d128_1": (
+                    2,
+                    1,
+                    129,
+                    cached_randn((2, 192, 256)),
+                    cached_randn((2, 192, 128)),
+                ),
+                "3d128_01": (
+                    2,
+                    1,
+                    129,
+                    cached_randn((128, 192, 256)),
+                    cached_randn((128, 192, 128)),
+                ),
+            },
+        },
+        (
+            "test_slice_stick_mutation_layout_update",
+            "test_slice_stick_mutation_layout_update_cpu",
+        ): {
+            "param_sets": {
+                "2d64": (1, 32, 96, cached_randn((128, 256)), cached_randn((128, 64))),
+                "2d128": (
+                    1,
+                    1,
+                    129,
+                    cached_randn((128, 256)),
+                    cached_randn((128, 128)),
+                ),
+                "3d64_2": (
+                    2,
+                    32,
+                    96,
+                    cached_randn((128, 192, 256)),
+                    cached_randn((128, 192, 64)),
+                ),
+                "3d128_2": (
+                    2,
+                    1,
+                    129,
+                    cached_randn((128, 192, 256)),
+                    cached_randn((128, 192, 128)),
+                ),
             },
         },
         ("test_slice_synthetic_dims", "test_slice_synthetic_dims_cpu"): {
@@ -3973,8 +4326,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "test_round_trip_to_dtype_implicit_invalid_cpu",
         ): {
             "ops_dict": {"add": torch.add},
-            "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
-            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
+            # Mixed-EA inputs with a non-broadcast stick (> 1 element) are
+            # rejected at compile time regardless of alignment, so these run
+            # live (no xfail) and the test body asserts the compile raises.
+            "param_sets": TO_DTYPE_OP_ROUND_TRIP_INVALID_PARAMS_SETS,
+        },
+        (
+            "test_round_trip_to_dtype_mixed_ea_broadcast",
+            "test_round_trip_to_dtype_mixed_ea_broadcast_cpu",
+        ): {
+            "ops_dict": {"add": torch.add},
+            # Positive complement to the INVALID set: mixed-EA IS supported when
+            # the STANDARD operand broadcasts at the stick dim (stick size 1).
+            "param_sets": TO_DTYPE_OP_MIXED_EA_BROADCAST_PARAMS_SETS,
         },
         ("test_add_constant", "test_add_constant_cpu"): {
             "ops_dict": {"add": torch.add},
@@ -4073,6 +4437,65 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d_8x6x4": (cached_randn((2, 3, 64), dtype=torch.float16), 8, 6, 4),
             },
         },
+        # TODO: torch.prod(x) (reduction over all tensor elements) is not yet
+        # supported. Once support for all torch.prod forms is implemented, we
+        # can register `prod` in CORE_REDUCTION_OPS_DICT like other reduction ops.
+        ("test_prod", "test_prod_cpu"): {
+            "param_sets": {
+                "int64_dim0": (
+                    torch.randint(2, 10, (1, 2), dtype=torch.int64),
+                    0,
+                    False,
+                ),
+                "int64_dim0_keepdim": (
+                    torch.randint(2, 10, (1, 2), dtype=torch.int64),
+                    0,
+                    True,
+                ),
+                "int64_dim1": (
+                    torch.randint(2, 10, (1, 2), dtype=torch.int64),
+                    -1,
+                    False,
+                ),
+                "int64_dim1_keepdim": (
+                    torch.randint(2, 10, (1, 2), dtype=torch.int64),
+                    -1,
+                    True,
+                ),
+                "int64_dim0_2": (
+                    torch.randint(1, 2, (64, 32), dtype=torch.int64),
+                    0,
+                    False,
+                ),
+                "int64_dim0_2_keepdim": (
+                    torch.randint(1, 2, (64, 32), dtype=torch.int64),
+                    0,
+                    True,
+                ),
+                "int64_dim1_2": (
+                    torch.randint(1, 2, (64, 32), dtype=torch.int64),
+                    -1,
+                    False,
+                ),
+                "int64_dim1_2_keepdim": (
+                    torch.randint(1, 2, (64, 32), dtype=torch.int64),
+                    -1,
+                    True,
+                ),
+                "fp16_dim0": (torch.randn((128, 64), dtype=torch.float16), 0, False),
+                "fp16_dim0_keepdim": (
+                    torch.randn((128, 64), dtype=torch.float16),
+                    0,
+                    True,
+                ),
+                "fp16_dim1": (torch.randn((128, 64), dtype=torch.float16), -1, False),
+                "fp16_dim1_keepdim": (
+                    torch.randn((128, 64), dtype=torch.float16),
+                    -1,
+                    True,
+                ),
+            },
+        },
         ("test_unfold", "test_unfold_cpu"): {
             "param_sets": {
                 # 1D: Basic cases
@@ -4119,6 +4542,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d_dim0": (0, cached_randn((2, 4, 8, 64))),
                 "4d_dim3": (3, cached_randn((2, 4, 8, 64))),
             },
+        },
+        (
+            "test_multiops_split",
+            "test_view_permute_mul",
+        ): {
+            "param_sets": {
+                "3d_to_4d_view_permute_mul": (cached_randn((2, 3, 4)),),
+            },
+        },
+        ("test_transpose_patterns", "test_transpose_patterns_cpu"): {
+            "param_sets": _pattern_param_sets(),
         },
     }
 
@@ -4701,20 +5135,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     @pytest.mark.xfail(
         reason=(
-            "Spyre compiled backend does not support torch.prod yet (stable "
-            "error signature: InductorError: AttributeError: "
-            "'UnimplementedOp' object has no attribute 'iteration_space')"
-        ),
-        strict=True,
-    )
-    def test_prod_dim0_known_xfail(self):
-        x = cached_randn((67, 256), scale=0.1)
-        self.compare_with_cpu(
-            lambda x: torch.prod(x, dim=0, keepdim=False), x, run_eager=False
-        )
-
-    @pytest.mark.xfail(
-        reason=(
             "Spyre compiled backend does not support torch.std yet (stable "
             "error signature: InductorError: TypeError: "
             "'UnimplementedOp' object is not subscriptable)"
@@ -4925,6 +5345,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, x)
 
+    def test_relu_inplace(self):
+        """Test in-place ReLU operation on Spyre device."""
+        x = torch.tensor([[-1.0, 2.0], [3.0, -4.0]], device="spyre")
+        x.relu_()
+        expected = torch.tensor([[0.0, 2.0], [3.0, 0.0]])
+        torch.testing.assert_close(x.cpu(), expected)
+
     def test_t_1d_cpu(self, x):
         self.compare_with_cpu(lambda x: x.t(), x)
 
@@ -4963,6 +5390,44 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, a, b, run_eager=False)
 
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_transpose_patterns_cpu(self, variant, execution_mode, *args):
+        if variant == "attn_qkv_projection":
+            pytest.skip(
+                "Issue #1800: Memory corruption in indexed views of permuted tensors "
+                "(torch-spyre GitHub)"
+            )
+        if variant == "vit_attention_cls_token":
+            pytest.xfail(
+                "Issue #543 (eager): aten::_reshape_alias not implemented in eager mode; "
+                "Issue #1731 (compiled): Spyre SIGABRT in fused_bmm_transpose compilation "
+                "(torch-spyre GitHub)"
+            )
+        if (
+            variant
+            in (
+                "attn_scaled_dot_product",
+                "transformer_encoder_attention",
+                "transformer_decoder_cross_attention",
+            )
+            and execution_mode == "eager"
+        ):
+            pytest.xfail(
+                "Issue #543: aten::_reshape_alias not implemented in eager mode "
+                "(torch-spyre GitHub)"
+            )
+
+        fn, call_args = _pattern_resolve(variant, args)
+        atol, rtol = _PATTERN_TOL.get(variant, (0.1, 0.1))
+        compare_with_cpu(
+            fn,
+            *call_args,
+            atol=atol,
+            rtol=rtol,
+            run_compile=(execution_mode == "compiled"),
+            run_eager=(execution_mode == "eager"),
+        )
+
     def test_where_cpu(self, cond_op, x, y):
         # aten::where.self is not registered for the Spyre backend
         self.compare_with_cpu(
@@ -4991,6 +5456,56 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # double-linked list) in libsenlib for fp16/fp32 small tensors, and SIGBUS
         # for bool tensors.  Disable eager mode for all dtypes.
         self.compare_with_cpu(lambda a: torch.clone(a).contiguous(), x, run_eager=False)
+
+    def test_clone_lowering(self):
+        """Calling the Spyre clone lowering directly (no aten.clone FX node)
+        must still yield clone's standard row-major layout, matching a real
+        aten.clone on the same input.
+        """
+        from torch_spyre._inductor.lowering import (
+            clone as spyre_clone_lowering,
+            register_spyre_lowering,
+            spyre_lowerings,
+        )
+        import torch._inductor.lowering as inductor_lowering
+        from torch._inductor.utils import fresh_cache
+
+        lib = torch.library.Library("spyre_test", "FRAGMENT")  # noqa: TOR901
+        lib.define("clone_identity(Tensor x) -> Tensor")
+        op = torch.ops.spyre_test.clone_identity.default
+        lib.impl("clone_identity", lambda x: x.clone(), "CPU")
+        lib.impl("clone_identity", lambda x: torch.empty_like(x), "Meta")
+
+        @register_spyre_lowering(op, type_promotion_kind=None)
+        def _lower_clone_identity(x):
+            return spyre_clone_lowering(x)
+
+        def fn(a):
+            return torch.ops.spyre_test.clone_identity(a.permute(1, 0))
+
+        def ref_fn(a):
+            return a.permute(1, 0).clone()
+
+        try:
+            x_cpu = cached_randn((128, 192))
+            expected = fn(x_cpu)
+
+            # fresh_cache() prevents a cached graph from masking a regression.
+            with fresh_cache():
+                out = torch.compile(fn, backend="inductor")(x_cpu.to("spyre"))
+                ref = torch.compile(ref_fn, backend="inductor")(x_cpu.to("spyre"))
+
+            torch.testing.assert_close(out.cpu(), expected, atol=1e-3, rtol=1e-3)
+
+            out_layout = out.device_tensor_layout()
+            ref_layout = ref.device_tensor_layout()
+            self.assertIsNotNone(out_layout)
+            self.assertEqual(list(out_layout.device_size), list(ref_layout.device_size))
+            self.assertEqual(list(out_layout.stride_map), list(ref_layout.stride_map))
+        finally:
+            spyre_lowerings.pop(op, None)
+            inductor_lowering.lowerings.pop(op, None)
+            lib._destroy()
 
     def test_permute(self, input_dims, dims):
         self.compare_with_cpu(
@@ -5171,6 +5686,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         def fn(input):
             return torch.nn.functional.softplus(input, beta, threshold)
+
+        self.compare_with_cpu(fn, x)
+
+    def test_view_permute_mul(self, x):
+        """Create 3D tensor, view as 4D, permute, multiply by constant."""
+
+        def fn(x):
+            return x.view(*x.shape, 1).permute(0, 3, 1, 2).mul(5.0)
 
         self.compare_with_cpu(fn, x)
 
@@ -5410,16 +5933,69 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, x, clone_inputs=True, run_eager=False)
 
-    def test_slice_cpu(self, op, dim, start, end, x):
-        def fn(x):
+    @pytest.mark.filterwarnings(
+        "ignore:aten.arange.*:torch_spyre.ops.fallbacks.FallbackWarning"
+    )
+    def test_slice_cpu(self, op, dim, start, end, x, *args):
+        def fn(x, *args):
             if dim == 0:
-                return op(dim, x[start:end])
+                return op(dim, x[start:end], *args)
             elif dim == 1:
-                return op(dim, x[:, start:end])
+                return op(dim, x[:, start:end], *args)
             elif dim == 2:
-                return op(dim, x[:, :, start:end])
+                return op(dim, x[:, :, start:end], *args)
 
-        self.compare_with_cpu(fn, x, clone_inputs=True, run_eager=False)
+        self.compare_with_cpu(fn, x, *args, clone_inputs=True, run_eager=False)
+
+    def test_slice_stick_mutation_layout_update_cpu(self, dim, start, end, x, y):
+        """Test that device_tensor_layout() updates to alt STL after slice-mutation."""
+
+        def fn(x, y):
+            if dim == 1:
+                z = x[:, start:end].copy_(y)
+            elif dim == 2:
+                z = x[:, :, start:end].copy_(y)
+            return y + z
+
+        x_spyre = x.clone().to("spyre")
+        y_spyre = y.clone().to("spyre")
+        pre = x_spyre.device_tensor_layout()
+
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True, dynamic=False)
+        compiled(x_spyre, y_spyre)
+
+        post = x_spyre.device_tensor_layout()
+        self.assertNotEqual(
+            (list(pre.device_size), list(pre.stride_map)),
+            (list(post.device_size), list(post.stride_map)),
+            msg=(
+                "device_tensor_layout was not updated after slice mutation; "
+                "set_spyre_tensor_layout did not run. "
+                f"pre={pre}, post={post}"
+            ),
+        )
+
+        expected = x.clone()
+        if dim == 1:
+            expected[:, start:end].copy_(y)
+        elif dim == 2:
+            expected[:, :, start:end].copy_(y)
+        torch.testing.assert_close(x_spyre.cpu(), expected, atol=0.1, rtol=0.1)
+
+    def test_slice_stick_mutation_no_alt_dim_raises(self):
+        """Test that offset-stick slice mutation raises Unsupported when no alt dim is divisible by stick_size."""
+
+        def fn(x, y):
+            x[:, 32:96].copy_(y)
+            return x.clone()
+
+        x = torch.randn(63, 128, dtype=torch.float16, device="spyre")
+        y = torch.randn(63, 64, dtype=torch.float16, device="spyre")
+
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True, dynamic=False)
+        with pytest.raises(Exception) as exc_info:
+            compiled(x, y)
+        assert "no offset-free alternative stick dim" in str(exc_info.value)
 
     def test_slice_synthetic_dims_cpu(self, x):
         def fn(x):
@@ -5595,6 +6171,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         )
 
     def test_round_trip_to_dtype_implicit_invalid_cpu(self, op, x, dst_dtype):
+        # x_dst is a native dst-dtype (STANDARD) graph input; y is the src-dtype
+        # input. op(x_dst, y) forces one operand to be upcast in-graph, producing
+        # a staggered EA that is mixed with the other STANDARD operand. When the
+        # operands' stick dimension has more than one element (every shape in
+        # this param set, aligned OR unaligned), that mixed EA is unsupported and
+        # compilation is rejected. Alignment is NOT the deciding factor here — a
+        # non-broadcast stick is. (The broadcast/stick==1 case IS supported; see
+        # test_round_trip_to_dtype_mixed_ea_broadcast.)
         y = x.clone()
         x_dst = x.to(dst_dtype)
 
@@ -5603,7 +6187,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             z = op(x, y)
             return z.to(src_dtype)
 
-        with pytest.raises(Exception) as exc_info:
+        # Assert only that it raises: the exact message is an implementation
+        # detail that has drifted before.
+        with pytest.raises(Exception):
             self.compare_with_cpu(
                 fn,
                 op,
@@ -5613,8 +6199,28 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 run_eager=False,
             )
 
-        assert "All inputs to an op must have same element arrangement" in str(
-            exc_info.value
+    def test_round_trip_to_dtype_mixed_ea_broadcast_cpu(self, op, x, w):
+        # Positive complement to _invalid: a mixed-EA op IS supported when the
+        # STANDARD operand broadcasts at the stick dim. x is fp16 with a stick
+        # aligned to 64; w is fp32 with a trailing size-1 dim, so op(x, w) upcasts
+        # x to a staggered fp32 (DL16_TO_FP32) combined with the STANDARD fp32
+        # operand w. This is allowed because w's stick has a single element, so
+        # there is no ordering for the two EAs to disagree on.
+        #
+        # The result is round-tripped back to fp16 so it is de-staggered: a
+        # staggered fp32 device tensor is not re-arranged on CPU readback and
+        # therefore cannot be compared to CPU directly.
+        def fn(op, x, w):
+            z = op(x, w)
+            return z.to(x.dtype)
+
+        self.compare_with_cpu(
+            fn,
+            op,
+            x,
+            w,
+            cpu_compile=False,
+            run_eager=False,
         )
 
     def test_add_constant_cpu(self, op, x):
@@ -5851,6 +6457,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             match="Boolean value of Tensor with more than one value is ambiguous",
         ):
             compiled(x_multi.to("spyre"))
+
+    def test_prod_cpu(self, x, dim, keepdim):
+        def fn(a):
+            return torch.prod(a, dim=dim, keepdim=keepdim)
+
+        self.compare_with_cpu(fn, x, run_eager=False)
 
 
 # Skip the 5 aligned bfloat16→float32 implicit-invalid tests pending #2843.

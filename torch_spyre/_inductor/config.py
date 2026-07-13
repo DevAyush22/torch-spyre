@@ -60,6 +60,16 @@ ignore_work_division_hints: bool = (
     os.environ.get("SPYRE_INDUCTOR_IGNORE_HINTS", "0") == "1"
 )
 
+ignore_wsr_hints: bool = os.environ.get("SPYRE_INDUCTOR_IGNORE_HINTS", "0") == "1"
+
+# Disable compiler-generated span-overflow coarse-tiling hints.  The global
+# SPYRE_INDUCTOR_IGNORE_HINTS flag also disables these so one switch can still
+# suppress all WSR/coarse-tiling hint paths.
+ignore_span_overflow_hints: bool = (
+    ignore_wsr_hints
+    or os.environ.get("SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS", "0") == "1"
+)
+
 # For K-split matmuls, permute physical core IDs so the cores collaborating on a
 # K reduction land on adjacent ring positions, cutting PSUM chain hops from m*n
 # to 1. The split itself is chosen by the cost-model planner; this only reorders
@@ -68,19 +78,19 @@ core_id_k_fast_emission: bool = (
     os.environ.get("SPYRE_CORE_ID_K_FAST_EMISSION", "1") == "1"
 )
 
-# When False (default), HBM tensor addresses are baked as concrete integers
+# When True (default), HBM tensor addresses are emitted as runtime symbols
+# with !sdscbundle.input_arg<index> parameters and input_arg_extract ops
+# in the bundle.mlir.
+# When False, HBM tensor addresses are baked as concrete integers
 # into the SDSC JSON and bundle.mlir emits sdsc_execute with no operands.
-# When True, addresses are emitted as runtime symbols with
-# !sdscbundle.input_arg<index> parameters, input_arg_extract ops, and
-# affine.apply indirection for tiled loops.
-bundle_symbolic_args: bool = os.environ.get("BUNDLE_SYMBOLIC_ARGS", "0") == "1"
+bundle_symbolic_args: bool = os.environ.get("BUNDLE_SYMBOLIC_ARGS", "1") == "1"
 
 # When True (default), LoopSpec nodes are fully unrolled into flat OpSpecs
 # before generate_bundle runs.  Set to False to pass LoopSpecs through intact
 # for the scf.for / affine.apply path.
 unroll_loops: bool = os.environ.get("UNROLL_LOOPS", "1") == "1"
 
-# Layout solver class used by default in scratchpad.allocator.DefaultAllocator.
+# Layout solver class used by default in scratchpad.allocator.ScratchpadAllocator.
 # Options:
 #  "greedy":   GreedyLayoutSolver (default),
 #  "bestfit":  BestFitLayoutSolver,

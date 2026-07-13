@@ -18,6 +18,10 @@ from typing import Optional
 from abc import ABC, abstractmethod
 import math
 
+from torch_spyre._inductor.logging_utils import get_inductor_logger
+
+logger = get_inductor_logger("scratchpad.plan_solver")
+
 
 @dataclass
 class LifetimeBoundBuffer:
@@ -89,7 +93,7 @@ class MemoryPlanSolver(ABC):
 
     @abstractmethod
     def plan_layout(
-        self, buffers: list[LifetimeBoundBuffer]
+        self, buffers: list[LifetimeBoundBuffer], log_lx_usage: bool = False
     ) -> list[LifetimeBoundBuffer]:
         """
         Utilizes an implementation defined algorithm to determine
@@ -98,6 +102,7 @@ class MemoryPlanSolver(ABC):
 
         Args:
             buffers (list[LifetimeBoundBuffer]): The set of candidate buffers for memory planning
+            log_lx_usage (bool): If True, emit per-timestep scratchpad usage at DEBUG level.
 
         Returns:
             list[LifetimeBoundBuffer]: The set of buffers with their placements defined.
@@ -181,7 +186,7 @@ class GreedyLayoutSolver(MemoryPlanSolver):
                 self.usage.remove(buf)
 
     def plan_layout(
-        self, buffers: list[LifetimeBoundBuffer]
+        self, buffers: list[LifetimeBoundBuffer], log_lx_usage: bool = False
     ) -> list[LifetimeBoundBuffer]:
         """Allocates addresses to the provided buffer list
 
@@ -238,5 +243,24 @@ class GreedyLayoutSolver(MemoryPlanSolver):
             for buffer in buffers:
                 if idx == buffer.start_time:
                     self._try_allocate(buffer)
+
+        if log_lx_usage and logger.isEnabledFor(10):  # logging.DEBUG
+            logger.debug("scratchpad limit: %d KB", self.limit // 1024)
+            for idx in range(sorted_times[0], sorted_times[-1]):
+                live = []
+                # Sum by distinct address: an in-place reuse places two buffers
+                # (a dying parent and its just-born child) at the same address
+                # for one overlapping tick, and the child's region is contained
+                # in the parent's. Counting both would double-count the shared
+                # slot, so track the max size per address and sum those.
+                size_by_addr: dict[int, int] = {}
+                for b in buffers:
+                    if b.address is not None and b.start_time <= idx < b.end_time:
+                        live.append(f"{b.name}_{b.size // 1024}KB@{hex(b.address)}")
+                        size_by_addr[b.address] = max(
+                            size_by_addr.get(b.address, 0), b.size
+                        )
+                used = sum(size_by_addr.values())
+                logger.debug("t=%d: %d KB  [%s]", idx, used // 1024, ", ".join(live))
 
         return buffers

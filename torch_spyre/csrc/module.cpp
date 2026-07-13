@@ -99,7 +99,7 @@ void _startRuntime() {
               "Device index out of bounds. logical_device_id=",
               logical_device_id, ", number of visible devices=", num_devices);
 
-  std::shared_ptr<Runtime> runtime;
+  std::shared_ptr<flex::RuntimeContext> runtime;
   auto s = flex::initializeRuntime(&runtime, logical_device_id);
   init_from_env();
   if (runtime) {
@@ -117,7 +117,6 @@ void startRuntime() {
 }
 
 void freeRuntime() {
-  clearArtifactCache();
   GlobalRuntime::reset();
 }
 
@@ -194,13 +193,13 @@ PYBIND11_MODULE(_C, m) {
   m.def("start_runtime", &spyre::startRuntime);
   m.def("free_runtime", &spyre::freeRuntime);
   m.def("device_count", &spyre::getVisibleDeviceCount);
-  m.def("launch_kernel", &spyre::launchKernel);
   m.def("encode_constant", &spyre::encodeConstant);
 
   py::enum_<spyre::ElementArrangement>(m, "ElementArrangement")
       .value("STANDARD", spyre::ElementArrangement::STANDARD)
       .value("DL16_TO_FP32", spyre::ElementArrangement::DL16_TO_FP32)
-      .value("DL16_TO_FP8", spyre::ElementArrangement::DL16_TO_FP8)
+      .value("QFP8CH", spyre::ElementArrangement::QFP8CH)
+      .value("FP32_TO_DL16", spyre::ElementArrangement::FP32_TO_DL16)
       .value("EXX2", spyre::ElementArrangement::EXX2);
 
   py::class_<spyre::SpyreTensorLayout> dci_cls(m, "SpyreTensorLayout");
@@ -340,6 +339,11 @@ PYBIND11_MODULE(_C, m) {
         "Copy tensor between host and device using DMA", py::arg("self"),
         py::arg("dst"), py::arg("non_blocking") = false);
 
+  // Device-side fill using FillDMA (no host buffer or H2D copy)
+  m.def("fill_tensor", &spyre::spyre_fill_tensor,
+        "Fill a spyre tensor with a scalar value using device-side FillDMA",
+        py::arg("self"), py::arg("value"));
+
   // Stream management functions
   m.def("get_stream_from_pool", &spyre::getStreamFromPool, py::arg("device"),
         py::arg("priority") = 0,
@@ -443,8 +447,12 @@ PYBIND11_MODULE(_C, m) {
         "        If None, uses the current stream. Defaults to None.\n\n"
         "Returns:\n"
         "    Prepared JobPlan ready for execution");
-  m.def("launch_jobplan", &spyre::launchJobPlan, py::arg("job_plan"),
-        py::arg("args"),
+  // Bind the current-stream overload (resolves the current stream internally).
+  m.def("launch_jobplan",
+        static_cast<void (*)(const spyre::JobPlan&,
+                             const std::vector<at::Tensor>&)>(
+            &spyre::launchJobPlan),
+        py::arg("job_plan"), py::arg("args"),
         "Launch a prepared JobPlan with the given tensor arguments.\n\n"
         "Args:\n"
         "    job_plan: The JobPlan to execute\n"
