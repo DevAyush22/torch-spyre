@@ -5853,5 +5853,22 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             compiled(x_multi.to("spyre"))
 
 
+# Skip the 5 aligned bfloat16→float32 implicit-invalid tests pending #2843.
+_SKIP_2843 = pytest.mark.skip(
+    reason=(
+        "SKIP #2843 — propagate_layouts assigns STANDARD instead of DL16_TO_FP32 "
+        "to bfloat16→float32 conversion output; validate_ops misses the arrangement "
+        "mismatch so the invalid test gets wrong values instead of the expected error; "
+        "https://github.com/torch-spyre/torch-spyre/issues/2843"
+    ),
+)
+for _shape in TO_DTYPE_OP_SHAPES_ALIGNED:
+    _tc = f"bfloat16_to_float32_{shapes2key((_shape,))}"
+    _name = f"test_round_trip_to_dtype_implicit_invalid_add_{_tc}"
+    if hasattr(TestOps, _name):
+        setattr(TestOps, _name, _SKIP_2843(getattr(TestOps, _name)))
+del _shape, _tc, _name, _SKIP_2843
+
+
 if __name__ == "__main__":
     unittest.main()

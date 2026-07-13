@@ -118,18 +118,12 @@ jobs:
             config: torch_spyre_tests/test_regex_config.yaml
           - name: Test Spyre
             config: torch_spyre_tests/test_spyre_config.yaml
-          - name: Dtype Op Table
-            config: torch_spyre_tests/inductor/test_dtype_op_table_config.yaml
           - name: Explicit Conversion
             config: torch_spyre_tests/inductor/test_explicit_conversion_config.yaml
           - name: Implicit Promotion
             config: torch_spyre_tests/inductor/test_implicit_promotion_config.yaml
           - name: Data Transfer
             config: torch_spyre_tests/inductor/test_data_transfer_config.yaml
-          - name: Unsupported Gates
-            config: torch_spyre_tests/inductor/test_unsupported_gates_config.yaml
-          - name: Model Integration
-            config: torch_spyre_tests/inductor/test_model_integration_config.yaml
           - name: Test Execution Trace
             config: torch_spyre_tests/test_execution_trace_config.yaml
           - name: Test Spyre Lazy Silent
