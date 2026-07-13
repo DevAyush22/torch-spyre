@@ -838,7 +838,9 @@ class TestNegativeScalarOperations:
         x = torch.randn(4, 64, dtype=torch.bfloat16)
         result = _run_spyre(execution_mode, bf16_fp32_add, x)
         expected = x + 1.0
-        assert torch.allclose(result.cpu().float(), expected.float(), atol=0.1, rtol=0.1)
+        assert torch.allclose(
+            result.cpu().float(), expected.float(), atol=0.1, rtol=0.1
+        )
 
     def test_inplace_fp16_add_fp32_scalar_dtype_unchanged(self, execution_mode):
         """in-place fp16 += fp32_scalar must preserve fp16 dtype."""
