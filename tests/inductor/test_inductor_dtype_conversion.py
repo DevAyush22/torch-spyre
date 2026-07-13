@@ -28,7 +28,6 @@ import warnings
 
 import pytest
 import torch
-import torch.nn as nn
 from torch.testing._internal.common_utils import set_warn_always_context
 
 import utils_inductor
@@ -224,7 +223,9 @@ class TestExplicitConversion(unittest.TestCase):
     )
     def test_bfloat16_shortcut_from_fp32_value_correctness(self):
         """fp32.bfloat16() uses FP32TODL16_OP, SKIP #2205."""
-        x = cached_randn((4, 64), dtype=torch.float32, differentiation="sc04_bf16_from_fp32")
+        x = cached_randn(
+            (4, 64), dtype=torch.float32, differentiation="sc04_bf16_from_fp32"
+        )
 
         def fn(t):
             return t.bfloat16()
@@ -439,7 +440,9 @@ class TestImplicitPromotion(unittest.TestCase):
     def test_direct_mixed_dtype_add_4d_stick_aligned(self):
         """direct fp16+fp32 add on 4D (2,2,4,64) without workaround."""
         x = cached_randn((2, 2, 4, 64), differentiation="dir4d_fp16")
-        y = cached_randn((2, 2, 4, 64), dtype=torch.float32, differentiation="dir4d_fp32")
+        y = cached_randn(
+            (2, 2, 4, 64), dtype=torch.float32, differentiation="dir4d_fp32"
+        )
 
         def fn(a, b):
             return torch.add(a, b)
@@ -455,7 +458,9 @@ class TestImplicitPromotion(unittest.TestCase):
     def test_direct_mixed_dtype_add_5d_stick_aligned(self):
         """direct fp16+fp32 add on 5D (2,2,2,4,64) without workaround."""
         x = cached_randn((2, 2, 2, 4, 64), differentiation="dir5d_fp16")
-        y = cached_randn((2, 2, 2, 4, 64), dtype=torch.float32, differentiation="dir5d_fp32")
+        y = cached_randn(
+            (2, 2, 2, 4, 64), dtype=torch.float32, differentiation="dir5d_fp32"
+        )
 
         def fn(a, b):
             return torch.add(a, b)
@@ -471,7 +476,9 @@ class TestImplicitPromotion(unittest.TestCase):
     def test_direct_mixed_dtype_add_large_values(self):
         """direct fp16+fp32 add with large values (scale=100)."""
         x = cached_randn((4, 64), differentiation="dirlrg_fp16", scale=100.0)
-        y = cached_randn((4, 64), dtype=torch.float32, differentiation="dirlrg_fp32", scale=100.0)
+        y = cached_randn(
+            (4, 64), dtype=torch.float32, differentiation="dirlrg_fp32", scale=100.0
+        )
 
         def fn(a, b):
             return torch.add(a, b)
@@ -487,7 +494,9 @@ class TestImplicitPromotion(unittest.TestCase):
     def test_direct_mixed_dtype_add_small_values(self):
         """direct fp16+fp32 add with small values (scale=1e-3)."""
         x = cached_randn((4, 64), differentiation="dirsml_fp16", scale=1e-3)
-        y = cached_randn((4, 64), dtype=torch.float32, differentiation="dirsml_fp32", scale=1e-3)
+        y = cached_randn(
+            (4, 64), dtype=torch.float32, differentiation="dirsml_fp32", scale=1e-3
+        )
 
         def fn(a, b):
             return torch.add(a, b)
@@ -723,9 +732,9 @@ class TestImplicitPromotion(unittest.TestCase):
         y = cached_randn((4, 64), differentiation="wastack_y")
 
         def fn(a, b):
-            return torch.stack(
-                [a.to(torch.float32), b.to(torch.float32)]
-            ).to(torch.float16)
+            return torch.stack([a.to(torch.float32), b.to(torch.float32)]).to(
+                torch.float16
+            )
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
@@ -735,9 +744,9 @@ class TestImplicitPromotion(unittest.TestCase):
         y = cached_randn((4, 64), differentiation="wacat_y")
 
         def fn(a, b):
-            return torch.cat(
-                [a.to(torch.float32), b.to(torch.float32)], dim=0
-            ).to(torch.float16)
+            return torch.cat([a.to(torch.float32), b.to(torch.float32)], dim=0).to(
+                torch.float16
+            )
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
@@ -782,7 +791,9 @@ class TestImplicitPromotion(unittest.TestCase):
 
     def test_wa_sum_bf16_explicit_fp32(self):
         """bf16 sum workaround — explicit fp32 cast before summing."""
-        x = cached_randn((4, 64), dtype=torch.bfloat16, differentiation="wa_spe03bf16_sum")
+        x = cached_randn(
+            (4, 64), dtype=torch.bfloat16, differentiation="wa_spe03bf16_sum"
+        )
 
         def fn(t):
             return torch.sum(t.to(torch.float32))
@@ -846,9 +857,9 @@ class TestImplicitPromotion(unittest.TestCase):
         y = cached_randn((64, 128), differentiation="wanc_y")
 
         def fn(a, b):
-            return torch.add(
-                a.t().to(torch.float32), b.t().to(torch.float32)
-            ).to(torch.float16)
+            return torch.add(a.t().to(torch.float32), b.t().to(torch.float32)).to(
+                torch.float16
+            )
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
@@ -951,8 +962,9 @@ class TestDataTransfer(unittest.TestCase):
 
     def test_compiled_d2h_fp32_to_fp16(self):
         """compiled D2H fp32 → fp16 in one .to('cpu', dtype=fp16) call."""
-        x_cpu = torch.tensor([[1.0, 2.0, 3.0, 4.0],
-                               [5.0, 6.0, 7.0, 8.0]], dtype=torch.float32)
+        x_cpu = torch.tensor(
+            [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]], dtype=torch.float32
+        )
         x_spyre = x_cpu.to("spyre")
 
         def fn(t):
@@ -977,7 +989,9 @@ class TestDataTransfer(unittest.TestCase):
     )
     def test_compiled_copy_cross_dtype_fp32_to_fp16(self):
         """Compiled copy_() from fp32 into fp16 Spyre tensor — missing cross-format layout candidate."""
-        src_fp32 = cached_randn((4, 64), dtype=torch.float32, differentiation="cop02_src")
+        src_fp32 = cached_randn(
+            (4, 64), dtype=torch.float32, differentiation="cop02_src"
+        )
         dst_fp16 = torch.zeros(4, 64, dtype=torch.float16)
 
         def fn(d, s):

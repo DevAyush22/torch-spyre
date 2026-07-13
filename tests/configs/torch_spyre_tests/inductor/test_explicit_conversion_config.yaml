@@ -1,13 +1,6 @@
 test_suite_config:
   labels: [core, full]
   files:
-    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_dtype_scalars.py
-      unlisted_test_mode: skip
-      tests:
-        - names:
-            - TestNegativeScalarOperations::test_fp16_overflow_underflow
-          mode: mandatory_success
-
     - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_dtype_conversion.py
       unlisted_test_mode: skip
       tests:
