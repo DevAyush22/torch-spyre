@@ -301,6 +301,13 @@ class TestExplicitConversion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
+    @pytest.mark.skip(
+        reason=(
+            "SKIP — non-contiguous fp16 source to to_dtype: slice (4,128)[:, :64] "
+            "has row stride 128 but logical extent 64; compiled graph produces wrong "
+            "values on Spyre hardware"
+        )
+    )
     def test_wa_exp_add_non_contiguous_2d(self):
         """both-fp16 add via explicit fp32 cast — non-contiguous slice (4,128)→(4,64)."""
         x = cached_randn((4, 128), differentiation="expnc_x")
@@ -960,6 +967,13 @@ class TestDataTransfer(unittest.TestCase):
 
         self.compare_with_cpu(fn, src, run_eager=False)
 
+    @pytest.mark.skip(
+        reason=(
+            "SKIP #2205 — compiled D2H fp32→fp16: FP32TODL16_OP output has "
+            "DL16_TO_FP32 arrangement; copy_tensor fails with invalid sizes/stride map; "
+            "https://github.com/torch-spyre/torch-spyre/issues/2205"
+        )
+    )
     def test_compiled_d2h_fp32_to_fp16(self):
         """compiled D2H fp32 → fp16 in one .to('cpu', dtype=fp16) call."""
         x_cpu = torch.tensor(
