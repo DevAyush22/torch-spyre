@@ -190,6 +190,47 @@ VECTOR_NORM_KEEPDIM_PARAM_SETS = {
 }
 
 
+CUMSUM_PARAM_SETS = {
+    # 1-D: names encode the scan length
+    "1d_4": (0, cached_randn((4,))),
+    "1d_64": (0, cached_randn((64,))),
+    "1d_256": (0, cached_randn((256,))),
+    "1d_512": (0, cached_randn((512,), scale=0.1)),  # small values avoid fp16 overflow
+    "1d_explicit": (
+        0,
+        torch.tensor([1.0, 2.0, 3.0, 4.0, -1.0, 0.5, -0.5, 1.5], dtype=torch.float16),
+    ),
+    # 2-D, non-last dim (Path A)
+    "2d_dim_0": (0, cached_randn((67, 256))),
+    "2d_dim_0_n1": (0, cached_randn((1, 256))),  # n=1 is identity
+    "2d_dim_0_fp32": (0, cached_randn((67, 256), dtype=torch.float32)),
+    # 2-D, last dim (Path B) — B<4 exercises _MIN_B row-padding
+    "2d_dim_1_b1": (1, cached_randn((1, 256))),
+    "2d_dim_1_b2": (1, cached_randn((2, 256))),
+    "2d_dim_1_b3": (1, cached_randn((3, 256))),
+    "2d_dim_1_b4": (1, cached_randn((4, 256))),
+    "2d_dim_1_b8": (1, cached_randn((8, 256))),
+    "2d_dim_neg1": (-1, cached_randn((8, 256))),  # negative dim alias
+    # 3-D
+    "3d_dim_1": (1, cached_randn((4, 67, 256))),
+    "3d_dim_2_b1": (2, cached_randn((1, 1, 256))),
+    "3d_dim_2_b2": (2, cached_randn((1, 2, 256))),
+    "3d_dim_2_b4": (2, cached_randn((2, 2, 256))),
+    # 4-D
+    "4d_dim_neg1": (-1, cached_randn((1, 48, 1, 256))),
+    "4d_dim_2": (2, cached_randn((4, 5, 67, 256))),
+    # Padding-path: last dim not a stick multiple, exercises stick-alignment padding
+    "pad_2d_dim_0": (0, cached_randn((63, 129))),
+    "pad_2d_dim_1": (1, cached_randn((63, 129))),
+    "pad_2d_dim_1_b1": (1, cached_randn((1, 129))),  # B-padding + stick padding
+    "pad_2d_dim_1_b2": (1, cached_randn((2, 9))),  # B-padding + small last dim
+    "pad_3d_dim_1": (1, cached_randn((3, 7, 9))),
+    "pad_3d_dim_2": (2, cached_randn((3, 7, 9))),
+    "pad_4d_dim_2": (2, cached_randn((3, 7, 9, 32))),
+    "pad_4d_dim_3": (3, cached_randn((3, 7, 9, 32))),
+}
+
+
 SPYRE_MODE_SUPPORT_OVERRIDES_BY_OP = {
     torch.amin: {
         "compiled": True,
@@ -4629,6 +4670,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ("test_transpose_patterns", "test_transpose_patterns_cpu"): {
             "param_sets": _pattern_param_sets(),
         },
+        ("test_cumsum", "test_cumsum_cpu"): {
+            "param_sets": CUMSUM_PARAM_SETS,
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -4974,6 +5018,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_norm_keepdim1_cpu(self, op, ord, dim, x):
         _compare_op_with_cpu(lambda x: op(x, ord=ord, dim=dim, keepdim=True), op, x)
+
+    def test_cumsum_cpu(self, dim: int, x):
+        self.compare_with_cpu(lambda t: torch.cumsum(t, dim=dim), x, run_eager=False)
 
     def _get_core_reduction_invalid_dim_cases(self):
         x = cached_randn((3, 5, 64))

@@ -680,6 +680,88 @@ def bitwise_and(input1: torch.Tensor, input2: torch.Tensor) -> torch.Tensor:
         )
 
 
+# No native scan op on Spyre; implements cumsum via parallel prefix scan until #3388.
+@register_spyre_decompositions([torch.ops.aten.cumsum.default])
+def spyre_cumsum(
+    x: torch.Tensor,
+    dim: int,
+    dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    resolved_dtype = dtype if dtype is not None else x.dtype
+    if resolved_dtype in (torch.int32, torch.int64, torch.bool):
+        raise Unsupported(
+            f"spyre_cumsum: dtype {resolved_dtype} is not supported on Spyre; "
+            "only floating-point dtypes are supported"
+        )
+
+    y = x if dtype is None else x.to(dtype)
+    ndim = y.dim()
+    dim = dim % ndim  # normalise negative dim
+    n = y.shape[dim]
+
+    if dim == ndim - 1:
+        # Last dim: scan via transpose onto dim=0 to avoid stick-alignment violations.
+        _MIN_B = 4
+        _STICK = 128 // y.element_size()  # elements per stick (128 bytes / dtype size)
+        B = y.numel() // n
+        B_orig = B
+
+        y_2d = y.reshape(B, n)
+
+        if B < _MIN_B:
+            y_2d = torch.ops.aten.constant_pad_nd(y_2d, [0, 0, _MIN_B - B, 0], 0)
+            B = _MIN_B
+
+        cf = torch.contiguous_format
+
+        # Align B and n before transposing; B must be stick-aligned as the last dim.
+        B_scan = math.ceil(B / _STICK) * _STICK if B % _STICK != 0 else B
+        n_scan = math.ceil(n / _STICK) * _STICK if n > _STICK and n % _STICK != 0 else n
+        if B_scan != B or n_scan != n:
+            y_2d = torch.ops.aten.constant_pad_nd(
+                y_2d, [0, n_scan - n, 0, B_scan - B], 0
+            )
+
+        y_T = y_2d.transpose(0, 1).clone(memory_format=cf)  # (n_scan, B_scan)
+
+        # Parallel prefix scan; each pass doubles the scan reach.
+        offset = 1
+        while offset < n_scan:
+            sliced = torch.ops.aten.slice.Tensor(y_T, 0, 0, n_scan - offset)
+            shifted = torch.ops.aten.constant_pad_nd(sliced, [0, 0, offset, 0], 0)
+            y_T = y_T + shifted
+            offset *= 2
+
+        if n_scan != n:
+            y_T = torch.ops.aten.slice.Tensor(y_T, 0, 0, n)  # (n, B_scan)
+
+        result = y_T.transpose(0, 1).clone(memory_format=cf)  # (B_scan, n)
+
+        if B_scan != B:
+            result = torch.ops.aten.slice.Tensor(result, 0, 0, B)
+
+        if B_orig < _MIN_B:
+            # Original rows are at the end; drop the zero rows prepended earlier.
+            result = torch.ops.aten.slice.Tensor(result, 0, B - B_orig, B)
+
+        return result.reshape(*y.shape[:-1], n)
+
+    # Non-last dim: scan directly on scan dim, no reshape needed.
+    # pad_idx locates `dim` in constant_pad_nd's reverse-order pad spec.
+    pad_idx = 2 * (ndim - 1 - dim)
+
+    offset = 1
+    while offset < n:
+        sliced = torch.ops.aten.slice.Tensor(y, dim, 0, n - offset)
+        pad = [0] * (2 * ndim)
+        pad[pad_idx] = offset
+        shifted = torch.ops.aten.constant_pad_nd(sliced, pad, 0)
+        y = y + shifted
+        offset *= 2
+
+    return y
+
+
 @register_spyre_decompositions([torch.ops.aten.convolution.default])
 def conv2d_via_bmm_decomp(
     input: torch.Tensor,
