@@ -492,8 +492,16 @@ def _collect_index_tensor_layouts(
     symbol_mapping: dict,
     index_tensor_indices: set[int],
     logger: object,
+    gather_mb_injected: bool = False,
+    mb_sym: Symbol | None = None,
 ) -> tuple[dict, dict]:
     """First pass: compute (dim_order, stick_dim) for each index tensor.
+
+    When ``gather_mb_injected`` is True (P < stick_size gather), any index
+    tensor whose device coordinates are all-constant (empty dim_order) gets its
+    layout overridden to ``([mb_sym], mb_sym)``.  This gives the KERNEL_IDX a
+    non-empty ``layoutDimOrder_`` so deeptools' allocate-node assertion is
+    satisfied without rewriting the FX graph.
 
     Returns:
         index_tensor_layouts: dict mapping tensor_idx -> (dim_order, stick_dim)
@@ -505,6 +513,11 @@ def _collect_index_tensor_layouts(
     for i in index_tensor_indices:
         arg = op_spec.args[i]
         dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping)
+        if gather_mb_injected and not dim_order:
+            # P < stick_size: all device coordinates are constants; substitute
+            # the synthesised mb dimension so the KERNEL_IDX has a valid layout.
+            dim_order = [mb_sym]
+            stick_dim = mb_sym
         index_tensor_layouts[i] = (dim_order, stick_dim)
         active_dims = {d for d in dim_order if d is not stick_dim}
         index_active_dims[i] = active_dims
@@ -523,6 +536,7 @@ def _create_sdsc_tensors(
     op_dim_order: list[Symbol],
     op_stick_dim: Symbol | None,
     mb_sym: Symbol | None = None,
+    gather_mb_injected: bool = False,
 ) -> tuple[list[SDSCArgs], dict, Symbol | None]:
     dims = list(iteration_space.keys())
     layouts: dict = {}
@@ -536,12 +550,19 @@ def _create_sdsc_tensors(
     }
     has_indirect_access = bool(index_tensor_indices)
 
-    # For indirect access: pre-compute index tensor layouts (first pass)
+    # For indirect access: pre-compute index tensor layouts (first pass).
+    # Pass gather_mb_injected so index tensors with all-constant coordinates get
+    # their layout overridden to ([mb_sym], mb_sym) instead of ([], None).
     index_tensor_layouts: dict[int, tuple[list, Any]] = {}
     index_active_dims: dict[int, set] = {}
     if has_indirect_access:
         index_tensor_layouts, index_active_dims = _collect_index_tensor_layouts(
-            op_spec, symbol_mapping, index_tensor_indices, logger
+            op_spec,
+            symbol_mapping,
+            index_tensor_indices,
+            logger,
+            gather_mb_injected=gather_mb_injected,
+            mb_sym=mb_sym,
         )
 
     missing_dim = None
@@ -687,12 +708,27 @@ def _create_sdsc_tensors(
                 backGap[dim] = dev_dim_size - it_dim_size
                 strides[dim] = strides[dim] // dev_dim_size * it_dim_size
 
-        if mb_sym is not None:
+        # Inject mb_sym for dtype-conversion ops and for the non-index tensors
+        # of P<stick_size gathers.  For P<stick_size gathers the KERNEL_IDX
+        # tensor already has mb_sym in its dim_order (set by
+        # _collect_index_tensor_layouts) and its strides were computed in the
+        # per-dim loop above, so skip re-injection for it.
+        is_gather_index = (
+            gather_mb_injected and has_indirect_access and i in index_tensor_indices
+        )
+        if mb_sym is not None and not is_gather_index:
             dim_order = [mb_sym] + dim_order
             scales[mb_sym] = 1
             strides[mb_sym] = _calculate_device_stride(0, arg.device_size)
             offsets[mb_sym] = 0
-            max_dim_sizes[mb_sym] = -1
+            # For P<stick_size gather value tensors the KERNEL_IDX fetches
+            # exactly 1 row per mb iteration (matching what
+            # compute_indirect_max_dim_sizes returns for the P>=stick_size
+            # path).  For dtype-ops keep -1.
+            if gather_mb_injected and is_indirect_value_tensor(arg):
+                max_dim_sizes[mb_sym] = 1
+            else:
+                max_dim_sizes[mb_sym] = -1
 
         effective_stick = op_stick_dim if stick_dim is None else stick_dim
         layout_labels = MATMUL_LAYOUT_LABELS if not use_op_dims else LAYOUT_LABELS
@@ -983,6 +1019,36 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         work_slices = {mb_sym: 1, **work_slices}
         op_dim_order = [mb_sym] + op_dim_order
 
+    # P < stick_size gather: Inductor constant-folds the mb loop when P=1,
+    # leaving all-constant device coordinates on the index tensor.  deeptools
+    # requires a non-empty layoutDimOrder_ on every KERNEL_IDX allocate node.
+    # Inject a virtual mb dimension sized to stick_size (the index tensor's
+    # elems_per_stick) so the KERNEL_IDX gets [mb] as its layoutDimOrder_
+    # without any FX-level graph rewrite.  The value and output tensors pick up
+    # mb via the existing mb_sym injection in _create_sdsc_tensors.
+    gather_mb_injected: bool = False
+    if has_indirect_access and mb_sym is None:
+        for idx in index_tensor_indices:
+            idx_arg = op_spec.args[idx]
+            idx_dim_order, _ = _get_device_dim_order(idx_arg, symbol_mapping)
+            if not idx_dim_order:
+                # All-constant coords → P < stick_size. Synthesise mb = stick_size.
+                stick_size = idx_arg.device_dtype.elems_per_stick()
+                mb_sym = Symbol(INPUT_DIM_LABELS[0])
+                sdsc_iteration_space = {mb_sym: stick_size, **sdsc_iteration_space}
+                dim_splits = {mb_sym: 1, **dim_splits}
+                work_slices = {mb_sym: 1, **work_slices}
+                op_dim_order = [mb_sym] + op_dim_order
+                gather_mb_injected = True
+                logger.debug(
+                    "P<stick_size gather detected (index tensor %d, stick_size=%d): "
+                    "injecting virtual mb=%d into SDSC iteration space",
+                    idx,
+                    stick_size,
+                    stick_size,
+                )
+                break
+
     if op_stick_dim is None:
         if is_pool:
             # Pool op where C fits in one stick (e.g. C=1): the "out" (channel)
@@ -1015,6 +1081,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         op_dim_order,
         op_stick_dim,
         mb_sym,
+        gather_mb_injected=gather_mb_injected,
     )
     if missing_dim is not None:
         # A dimension was added to the iteration space, update splits and work slices
