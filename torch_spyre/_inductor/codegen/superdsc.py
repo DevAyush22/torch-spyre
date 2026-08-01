@@ -497,11 +497,10 @@ def _collect_index_tensor_layouts(
 ) -> tuple[dict, dict]:
     """First pass: compute (dim_order, stick_dim) for each index tensor.
 
-    When ``gather_mb_injected`` is True (P < stick_size gather), any index
-    tensor whose device coordinates are all-constant (empty dim_order) gets its
-    layout overridden to ``([mb_sym], mb_sym)``.  This gives the KERNEL_IDX a
-    non-empty ``layoutDimOrder_`` so deeptools' allocate-node assertion is
-    satisfied without rewriting the FX graph.
+    For P=1 gathers the index tensor has all-constant coordinates (no loop
+    variables), so its natural dim_order is empty.  When ``gather_mb_injected``
+    is True, override the layout to ``([mb_sym], mb_sym)`` so the KERNEL_IDX
+    has a valid non-empty layout.
 
     Returns:
         index_tensor_layouts: dict mapping tensor_idx -> (dim_order, stick_dim)
@@ -514,8 +513,7 @@ def _collect_index_tensor_layouts(
         arg = op_spec.args[i]
         dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping)
         if gather_mb_injected and not dim_order:
-            # P < stick_size: all device coordinates are constants; substitute
-            # the synthesised mb dimension so the KERNEL_IDX has a valid layout.
+            # P=1: index tensor has all-constant coords; use the synthetic dim.
             dim_order = [mb_sym]
             stick_dim = mb_sym
         index_tensor_layouts[i] = (dim_order, stick_dim)
@@ -708,11 +706,8 @@ def _create_sdsc_tensors(
                 backGap[dim] = dev_dim_size - it_dim_size
                 strides[dim] = strides[dim] // dev_dim_size * it_dim_size
 
-        # Inject mb_sym for dtype-conversion ops and for the non-index tensors
-        # of P<stick_size gathers.  For P<stick_size gathers the KERNEL_IDX
-        # tensor already has mb_sym in its dim_order (set by
-        # _collect_index_tensor_layouts) and its strides were computed in the
-        # per-dim loop above, so skip re-injection for it.
+        # Prepend mb_sym to all tensors except the P=1 index tensor, which
+        # already has mb_sym set by _collect_index_tensor_layouts.
         is_gather_index = (
             gather_mb_injected and has_indirect_access and i in index_tensor_indices
         )
@@ -721,10 +716,7 @@ def _create_sdsc_tensors(
             scales[mb_sym] = 1
             strides[mb_sym] = _calculate_device_stride(0, arg.device_size)
             offsets[mb_sym] = 0
-            # For P<stick_size gather value tensors the KERNEL_IDX fetches
-            # exactly 1 row per mb iteration (matching what
-            # compute_indirect_max_dim_sizes returns for the P>=stick_size
-            # path).  For dtype-ops keep -1.
+            # P=1 gather value tensor fetches exactly 1 row per iteration.
             if gather_mb_injected and is_indirect_value_tensor(arg):
                 max_dim_sizes[mb_sym] = 1
             else:
@@ -1019,33 +1011,37 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         work_slices = {mb_sym: 1, **work_slices}
         op_dim_order = [mb_sym] + op_dim_order
 
-    # P < stick_size gather: Inductor constant-folds the mb loop when P=1,
-    # leaving all-constant device coordinates on the index tensor.  deeptools
-    # requires a non-empty layoutDimOrder_ on every KERNEL_IDX allocate node.
-    # Inject a virtual mb dimension sized to stick_size (the index tensor's
-    # elems_per_stick) so the KERNEL_IDX gets [mb] as its layoutDimOrder_
-    # without any FX-level graph rewrite.  The value and output tensors pick up
-    # mb via the existing mb_sym injection in _create_sdsc_tensors.
+    # P=1 gather: when the index has only 1 element, Inductor eliminates the
+    # mb loop, leaving the index tensor with all-constant coordinates and no
+    # loop variable.  Inject a synthetic dim=1 so the KERNEL_IDX gets a valid
+    # non-empty layout, and the backend executes exactly one gather iteration.
     gather_mb_injected: bool = False
     if has_indirect_access and mb_sym is None:
         for idx in index_tensor_indices:
             idx_arg = op_spec.args[idx]
             idx_dim_order, _ = _get_device_dim_order(idx_arg, symbol_mapping)
             if not idx_dim_order:
-                # All-constant coords → P < stick_size. Synthesise mb = stick_size.
+                # All-constant coords → P=1. Use 1, not stick_size: stick_size
+                # iterations would overflow a 1-row output tensor.
                 stick_size = idx_arg.device_dtype.elems_per_stick()
-                mb_sym = Symbol(INPUT_DIM_LABELS[0])
-                sdsc_iteration_space = {mb_sym: stick_size, **sdsc_iteration_space}
+                # Pick the first label not already in op_dim_order to avoid
+                # collisions when a higher-rank gather has consumed "mb".
+                _existing_names = {s.name for s in op_dim_order}
+                _p1_label = next(
+                    lbl for lbl in INPUT_DIM_LABELS if lbl not in _existing_names
+                )
+                mb_sym = Symbol(_p1_label)
+                sdsc_iteration_space = {mb_sym: 1, **sdsc_iteration_space}
                 dim_splits = {mb_sym: 1, **dim_splits}
                 work_slices = {mb_sym: 1, **work_slices}
                 op_dim_order = [mb_sym] + op_dim_order
                 gather_mb_injected = True
                 logger.debug(
-                    "P<stick_size gather detected (index tensor %d, stick_size=%d): "
-                    "injecting virtual mb=%d into SDSC iteration space",
+                    "P=1 gather detected (index tensor %d, stick_size=%d): "
+                    "injecting virtual %s=1 into SDSC iteration space",
                     idx,
                     stick_size,
-                    stick_size,
+                    _p1_label,
                 )
                 break
 
