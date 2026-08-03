@@ -12,7 +12,7 @@ mirrors the workaround already used elsewhere for the same relay.
 Usage (called by the GHA workflow):
     python3 ingest_pytorch_dispatch.py \
         --payload-file payload.json \
-        --dispatch-type pull_request \
+        --event-type pull_request \
         --run-id    "74526099734" \
         --run-link  "https://github.com/org/repo/actions/runs/74526099734"
 """
@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS pytorch_ci_dispatches
 (
     delivery_id     String,
 
-    dispatch_kind   LowCardinality(String) DEFAULT '',
+    event_type      LowCardinality(String) DEFAULT '',
     action          LowCardinality(String) DEFAULT '',
     pr_event        LowCardinality(String) DEFAULT '',
 
@@ -95,25 +95,30 @@ _DIRECT_PR_EVENTS = {
 
 
 def classify_pr_event(action: str, pull_request: dict) -> str:
-    """Map a pull_request payload's `action` to a stable pr_event label."""
+    """Map a pull_request payload's `action` to a stable pr_event label.
+
+    A PR is "merged" if either `pull_request.merged` is `true` or it carries
+    the "Merged" label pytorch's own CI applies — check both, since neither
+    field is reliably populated on every repository_dispatch-forwarded
+    payload on its own.
+    """
     if action in _DIRECT_PR_EVENTS:
         return _DIRECT_PR_EVENTS[action]
 
     if action == "closed":
         labels = pull_request.get("labels") or []
         label_names = {lbl.get("name") for lbl in labels if isinstance(lbl, dict)}
-        return "merged" if "Merged" in label_names else "closed"
+        is_merged = pull_request.get("merged") is True or "Merged" in label_names
+        return "merged" if is_merged else "closed"
 
     # Anything else (edited, labeled, assigned, ...) is passed through
     # verbatim so nothing is silently dropped from the dashboard.
     return action or "unknown"
 
 
-def classify_dispatch_kind(dispatch_type: str, payload_event_type: str) -> str:
-    kind = (dispatch_type or payload_event_type or "").strip()
-    if kind in ("pull_request", "push"):
-        return kind
-    return "other" if kind else ""
+def resolve_event_type(cli_event_type: str, payload_event_type: str) -> str:
+    """The repository_dispatch event type, recorded as-is (e.g. pull_request | push)."""
+    return _str(cli_event_type) or _str(payload_event_type)
 
 
 # ---------------------------------------------------------------------------
@@ -140,18 +145,16 @@ def build_row(
     payload = client_payload.get("payload") or {}
     action = _str(payload.get("action"))
     pull_request = payload.get("pull_request") or {}
-    dispatch_kind = classify_dispatch_kind(
-        args.dispatch_type, _str(client_payload.get("event_type"))
+    event_type = resolve_event_type(
+        args.event_type, _str(client_payload.get("event_type"))
     )
     pr_event = (
-        classify_pr_event(action, pull_request)
-        if dispatch_kind == "pull_request"
-        else ""
+        classify_pr_event(action, pull_request) if event_type == "pull_request" else ""
     )
 
     return {
         "delivery_id": _str(client_payload.get("delivery_id")),
-        "dispatch_kind": dispatch_kind,
+        "event_type": event_type,
         "action": action,
         "pr_event": pr_event,
         "pr_number": _int(payload.get("number") or pull_request.get("number")),
@@ -178,7 +181,7 @@ PROGRESS_STATES = ("", "in_progress", "completed", "rejected")
 
 COLUMN_NAMES = [
     "delivery_id",
-    "dispatch_kind",
+    "event_type",
     "action",
     "pr_event",
     "pr_number",
@@ -210,9 +213,9 @@ def main() -> None:
         help="Path to the JSON file holding the repository_dispatch client_payload",
     )
     parser.add_argument(
-        "--dispatch-type",
+        "--event-type",
         default="",
-        help="repository_dispatch type (github.event.action), e.g. pull_request | push",
+        help="repository_dispatch event type (github.event.action), e.g. pull_request | push",
     )
     parser.add_argument(
         "--run-id", default="0", help="GHA run ID of the ingesting workflow"
@@ -268,7 +271,7 @@ def main() -> None:
 
     print("[info] Classified dispatch:")
     print(f"[info]   delivery_id : {row['delivery_id']}")
-    print(f"[info]   dispatch_kind: {row['dispatch_kind']}")
+    print(f"[info]   event_type  : {row['event_type']}")
     print(f"[info]   action      : {row['action']}")
     print(f"[info]   pr_event    : {row['pr_event']}")
     print(f"[info]   pr_number   : {row['pr_number']}")
