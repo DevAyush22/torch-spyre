@@ -1338,7 +1338,7 @@ def spyre_masked_scatter(
     # rows would get -1, so multiply by the mask to send them to row 0 instead
     # (in bounds, and discarded by the where). Done in fp32: Spyre has no usable
     # int `clip`, int32 sub/mul are unsupported, and fp16 loses large indices.
-    pos = mask_row.cumsum(0).to(torch.float32) - 1.0
+    pos = mask_row.to(torch.float32).cumsum(0) - 1.0
     row_idx = (pos * mask_row.to(torch.float32)).to(torch.int64)
     # The gather stays 2D (its args are indirect, so the pointwise dim_order
     # projection skips them), but the `where` must stay at `self`'s rank:

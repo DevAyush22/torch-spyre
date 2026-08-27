@@ -657,7 +657,9 @@ def spyre_cumsum_cpu_fallback(input: torch.Tensor, dim: int) -> torch.Tensor:
 
 @spyre_cumsum_cpu_fallback.register_fake
 def _(input: torch.Tensor, dim: int) -> torch.Tensor:
-    return input.new_empty(input.shape)
+    # torch.cumsum promotes bool/int32 to int64; match the real output dtype.
+    out_dtype = torch.int64 if input.dtype in (torch.bool, torch.int32) else input.dtype
+    return input.new_empty(input.shape, dtype=out_dtype)
 
 
 @torch.library.custom_op("spyre::min_dim_int64_fallback", mutates_args=())
