@@ -109,17 +109,66 @@ _SIGNAL_NAMES = {
     "15": "SIGTERM",
 }
 
-# Hardware environment variables (appear only in final attempt's DTLOG dump)
-RE_NODE_NAME = re.compile(r"GHA_RUNNER_POD_NODE_NAME\s*->\s*(?P<v>\S+)")
-RE_PCI_DEVICE = re.compile(r"PCIDEVICE_IBM_COM_AIU_PF\s*->\s*(?P<v>[0-9a-f:.]+)")
-RE_AIU_RANK0 = re.compile(r"AIU_WORLD_RANK_0\s*->\s*(?P<v>[0-9a-f:.]+)")
+# Hardware environment variables.
+# Two independent sources feed these fields:
+#   1. The "Gather runner info" composite action
+#      (.github/actions/gather-runner-info) echoes
+#      "GHA_RUNNER_POD_NODE_NAME <value>" / "GHA_RUNNER_POD_NAME <value>" /
+#      "PCIDEVICE_IBM_COM_AIU_PF <value>" on every attempt, and its verbose
+#      env dump additionally prints "PCIDEVICE_IBM_COM_AIU_PF=<value>" style
+#      lines. This is the reliable source: it fires on every attempt.
+#   2. The Spyre runtime's own DTLOG_LEVEL=Info dump, which only fires on the
+#      FINAL attempt and uses a "KEY -> value" format.
+# These patterns accept a plain space, "=", or "->" separator so either
+# source matches. `(?!\w)` after the var name stops "GHA_RUNNER_POD_NAME"
+# from matching as a prefix of "GHA_RUNNER_POD_NAMESPACE". Separators use
+# `[ \t]*`, not `\s*` — `\s*` also matches newlines, which lets an empty
+# value (var echoed with nothing after it) swallow the following line's key
+# as its own value.
+# The value character class is restricted (not `\S+`) to keep two things out:
+#   - `$` and `"`: GHA prints a "script preview" line before a step runs,
+#     containing the step's literal source text -- e.g.
+#     `echo "GHA_RUNNER_POD_NODE_NAME $GHA_RUNNER_POD_NODE_NAME"` -- which
+#     appears BEFORE the real output in the log and would otherwise be the
+#     first (wrong) match `_first_env` finds, capturing garbage like
+#     `$GHA_RUNNER_POD_NODE_NAME"` off the `$`-prefixed variable reference.
+#   - ANSI escape bytes from that same preview line's syntax highlighting.
+# `*` IS included: GHA's own secret redaction can replace a substring
+# in-place with a literal "***" (e.g. a pod name containing a token that
+# happens to match a registered secret), so real values can legitimately
+# contain it -- excluding it would truncate the value at the mask.
+RE_NODE_NAME = re.compile(
+    r"GHA_RUNNER_POD_NODE_NAME(?!\w)[ \t]*(?:->|=)?[ \t]*(?P<v>[\w.*-]+)"
+)
+RE_POD_NAME = re.compile(
+    r"GHA_RUNNER_POD_NAME(?!\w)[ \t]*(?:->|=)?[ \t]*(?P<v>[\w.*-]+)"
+)
+# gather-runner-info's own script preview -- `echo "PCIDEVICE_IBM_COM_AIU_PF
+# ${PCIDEVICE_IBM_COM_AIU_PF:-}"` -- references the var name TWICE on one
+# line. The first occurrence is followed by `$` (rejected, not in the value
+# class), but the SECOND occurrence, inside `${...:-}`, is followed by `:`,
+# which the old `[0-9a-fA-F:.,]+` class allowed -- capturing a bare ':' as
+# the "value" before ever reaching the real output line. Real PCI addresses
+# always start with a hex digit (e.g. "0000:..."), so requiring the first
+# captured character to be one rejects that bare-colon false match.
+RE_PCI_DEVICE = re.compile(
+    r"PCIDEVICE_IBM_COM_AIU_PF(?!\w)[ \t]*(?:->|=)?[ \t]*(?P<v>[0-9a-fA-F][0-9a-fA-F:.,]*)"
+)
+RE_AIU_RANK0 = re.compile(
+    r"AIU_WORLD_RANK_0(?!\w)[ \t]*(?:->|=)?[ \t]*(?P<v>[0-9a-fA-F][0-9a-fA-F:.,]*)"
+)
 RE_PCI_DEV_ID = re.compile(
     r"pcidevid\.cpp.*?Device id \(for card idx \d+\):\s*(?P<v>[0-9a-f:.]+)"
 )
 RE_OPENED = re.compile(r"Opened:\s*SEN:VFIO:TYPE1:(?P<v>[0-9a-f:.]+)")
 
 # Chip identifiers (also final-attempt only)
-RE_RAW_ECID = re.compile(r"Raw ECID\s*=\s*(?P<v>0x[0-9a-fA-F]+\s+0x[0-9a-fA-F]+)")
+# vfio_hal_mnt.cpp prints the first ECID word with a doubled prefix
+# ("Raw ECID = 0x0x0000000002038000 0x03e3..."), so `0x` must be repeatable —
+# a single-`0x` pattern matches nothing at all.
+RE_RAW_ECID = re.compile(
+    r"Raw ECID\s*=\s*(?P<v>(?:0x)+[0-9a-fA-F]+\s+(?:0x)+[0-9a-fA-F]+)"
+)
 RE_CHIP_COORDS = re.compile(
     r"CHIPY=(?P<chipy>0x[0-9a-fA-F]+)\s+CHIPX=(?P<chipx>0x[0-9a-fA-F]+)"
 )
@@ -127,7 +176,14 @@ RE_WAFER_ID = re.compile(r"Mfg WaferID\s*=\s*(?P<v>\S+)")
 RE_MFG_XY = re.compile(r"Mfg \(X,Y\)\s*=\s*\((?P<x>\d+),(?P<y>\d+)\)")
 RE_CARD_SERIAL = re.compile(r"Card 11S S/N\s*=\s*(?P<v>\S+)")
 
-# Log-line timestamps
+# Log-line timestamps.
+#
+# GHA prefixes virtually every log line with its own ISO-8601 stamp, so that is
+# the reliable source. RE_LOG_TS matches the runtime's DTLOG format instead,
+# which only appears once the device layer starts talking (~line 1600 of a
+# typical job log) — it is kept as a fallback for logs captured without the
+# GHA prefix.
+RE_GHA_TS = re.compile(r"^\ufeff?(?P<iso>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)\s")
 RE_LOG_TS = re.compile(
     r"(?:ERRR|WARN|INFO|DBUG)\s+"
     r"(?P<day>\d{2})\.(?P<month>\d{2})\.(?P<year>\d{4})\s+"
@@ -171,6 +227,16 @@ def _ras_name_to_reason(name: str) -> str:
 
 
 def _parse_log_ts(line: str) -> str | None:
+    """Timestamp for a log line: GHA's ISO-8601 prefix, else the DTLOG stamp."""
+    m = RE_GHA_TS.match(line)
+    if m:
+        # GHA stamps are always UTC; drop the trailing Z so the value stays
+        # naive-UTC like the DTLOG branch below and the ClickHouse column.
+        try:
+            return datetime.fromisoformat(m["iso"].removesuffix("Z")).isoformat()
+        except ValueError:
+            pass
+
     m = RE_LOG_TS.search(line)
     if not m:
         return None
@@ -421,7 +487,9 @@ def parse_log(text: str, run_id: str, suite_hint: str = "") -> list[dict[str, An
         }
 
         # -------------------- Attempt start timestamp ----------------------------------------
-        for line in chunk_lines[:20]:
+        # Scan the whole chunk, not a leading window: a chunk opens with GHA
+        # setup output and the first parseable stamp can be far in.
+        for line in chunk_lines:
             ts = _parse_log_ts(line)
             if ts:
                 rec["attempt_start_ts"] = ts
@@ -510,23 +578,42 @@ def parse_log(text: str, run_id: str, suite_hint: str = "") -> list[dict[str, An
             rec["failure_phase"] = "execution"
 
         # ---------------- Hardware identifiers ------------------------
-        rec["node_name"] = _first_env(RE_NODE_NAME, chunk)
+        # node_name/pod_name/pci_device/aiu_rank0 come from the "Gather
+        # runner info" action, which runs ONCE per job as its own step,
+        # BEFORE the "=== Attempt N/M ===" banners emitted by the test-runner
+        # step. That output sits outside every per-attempt `chunk` (chunks
+        # start at each banner line), so these fields are searched against
+        # the full per-job log `text`, not `chunk` — they're job-wide
+        # constants (same runner pod for every attempt) anyway, and `text`
+        # is a superset of `chunk` so the old DTLOG-based match still works.
+        #
+        # Prefer the k8s node name; fall back to the runner pod name when the
+        # node name env var isn't populated (e.g. some clusters only expose
+        # GHA_RUNNER_POD_NAME via the downward API, not the node name).
+        rec["node_name"] = _first_env(RE_NODE_NAME, text) or _first_env(
+            RE_POD_NAME, text
+        )
         rec["pci_device"] = (
-            _first_env(RE_PCI_DEVICE, chunk)
+            _first_env(RE_PCI_DEVICE, text)
             or _first_env(RE_PCI_DEV_ID, chunk)
             or _first_env(RE_OPENED, chunk)
         )
-        rec["aiu_world_rank0"] = _first_env(RE_AIU_RANK0, chunk)
-        rec["card_serial"] = _first_env(RE_CARD_SERIAL, chunk)
-        rec["chip_ecid_raw"] = _first_env(RE_RAW_ECID, chunk)
-        rec["chip_wafer_id"] = _first_env(RE_WAFER_ID, chunk)
+        rec["aiu_world_rank0"] = _first_env(RE_AIU_RANK0, text)
 
-        m_xy = RE_MFG_XY.search(chunk)
+        # Same job-wide-constant reasoning as node_name/pci_device above: the
+        # card and chip identity block is printed once by the device-setup step,
+        # usually outside any attempt window, so it must be read from `text`.
+        # Scoping these to `chunk` populated them in only ~1% of rows.
+        rec["card_serial"] = _first_env(RE_CARD_SERIAL, text)
+        rec["chip_ecid_raw"] = _first_env(RE_RAW_ECID, text)
+        rec["chip_wafer_id"] = _first_env(RE_WAFER_ID, text)
+
+        m_xy = RE_MFG_XY.search(text)
         if m_xy:
             rec["chip_mfg_x"] = m_xy["x"]
             rec["chip_mfg_y"] = m_xy["y"]
 
-        m_coords = RE_CHIP_COORDS.search(chunk)
+        m_coords = RE_CHIP_COORDS.search(text)
         if m_coords:
             rec["chip_chipy"] = m_coords["chipy"]
             rec["chip_chipx"] = m_coords["chipx"]

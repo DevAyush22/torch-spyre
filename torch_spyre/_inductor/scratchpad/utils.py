@@ -28,6 +28,7 @@ from torch._inductor.ops_handler import WrapperHandler
 import sympy
 
 from torch_spyre._inductor import config
+from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.pass_utils import (
     _per_core_view_on_buf,
     concretize_expr,
@@ -35,58 +36,36 @@ from torch_spyre._inductor.pass_utils import (
     device_coordinates,
 )
 from torch._inductor.ir import MutationLayoutSHOULDREMOVE, ComputedBuffer
+from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
 
-# Op outputs eligible for LX-pinning. `amax` is the lowered form of
-# `max`; both names are listed to match whichever the IR shows.
-OP_OUTPUT_GOOD_FOR_LX_REUSE = frozenset(
+# Op outputs NOT eligible for LX-pinning; every other op is eligible by
+# default. `convolution` is aten's direct-conv op name and `conv2d` is the
+# depthwise (`torch.ops.spyre.conv2d`) op name -- both are listed because a
+# stride-2 direct-lowered conv miscomputes (shuffled spatial elements) when
+# its output is pinned to LX; see the direct-lowering codegen follow-up
+# tracked from PR #3284.
+OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE = frozenset(
     {
-        "max",
-        "amax",
-        "maximum",
-        "sum",
-        # "clone",
-        "exp",
-        "sub",
-        "mul",
-        "mean",
-        "add",
-        "rsqrt",
-        "neg",
-        "mm",
-        "bmm",
-        "batched_matmul",
-        "div",
-        "realdiv",
-        "expand",
-        "silu",
+        "convolution",
+        "conv2d",
     }
 )
+
+
+def round_up_to_alignment(arg: int, alignment: int) -> int:
+    return ((arg + alignment - 1) // alignment) * alignment
 
 
 def clone_at_graph_boundaries() -> bool:
     """True when clone ops are eligible for LX, enabling clone insertion at graph
     input/output boundaries so those buffers can also be LX-pinned.
 
-    Gated by the dedicated ``lx_boundary_clones`` flag (or, legacy, by listing
-    "clone" in OP_OUTPUT_GOOD_FOR_LX_REUSE). It intentionally does NOT consult
-    ``allow_all_ops_in_lx_planning``: that flag widens intermediate-output
-    eligibility and is set broadly (e.g. the LX-planning op suite), so coupling
-    it here would silently turn on the not-yet-correct boundary clone path."""
-    return config.lx_boundary_clones or "clone" in OP_OUTPUT_GOOD_FOR_LX_REUSE
-
-
-class GraphView:
-    """
-    Simple wrapper which allows filtering of returned operations
-    without mutating the underlying graph.
-    """
-
-    def __init__(self, graph, predicate):
-        self.graph = graph
-        self.operations = predicate(graph)
-
-    def __getattr__(self, name):
-        return getattr(self.graph, name)
+    Gated by "clone" being absent from OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE. It
+    intentionally does NOT consult ``allow_all_ops_in_lx_planning``: that flag
+    widens intermediate-output eligibility and is set broadly (e.g. the
+    LX-planning op suite), so coupling it here would silently turn on the
+    boundary clone path in contexts that don't intend to exercise it."""
+    return "clone" not in OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE
 
 
 def calculate_liveness(graph: GraphLowering) -> dict[str, list[int]]:
@@ -94,10 +73,21 @@ def calculate_liveness(graph: GraphLowering) -> dict[str, list[int]]:
     at which that buffer is accessed (read or written).  Graph inputs are seeded with
     an empty list; unused inputs remain empty.
 
-    Note: previously, unused graph inputs did not appear in the returned dict at all.
-    Now they appear with an empty list.  Callers that skip buffers with ``len(uses) <= 1``
-    (e.g. ``_build_bound_buffers``) will still skip unused inputs correctly, since
-    ``len([]) == 0 <= 1``."""
+    Indices are *distinct*: one entry per accessing operation, not per access.
+    ``rw.reads | rw.writes`` is a set of dependencies rather than of names, so an
+    op that touches one buffer through two different index expressions -- e.g. the
+    fused ``x[:, 0:512] + x[:, 512:1024]``, which reads ``arg0_1`` at
+    ``1024*d0 + d1`` and at ``1024*d0 + d1 + 512`` -- contributes two deps naming
+    it, and appending per dep would repeat that op's index.  A repeat is not
+    meaningful here (``start_time``/``end_time`` bracket the list and cannot see
+    it) and it inflates ``read_count``, so it is dropped.  This is what lets
+    :class:`~torch_spyre._inductor.scratchpad.plan_solver.LifetimeBoundBuffer`
+    require strictly increasing ``uses``, and makes ``read_count == 0`` mean
+    exactly "written but never read" for a computed buffer.
+
+    Note: previously, unused graph inputs did not appear in the returned dict at
+    all.  Now they appear with an empty list, and ``_build_bound_buffers`` skips
+    them on ``not uses``."""
     liveness: dict[str, list[int]] = {}
     for input_name in graph.graph_input_names:
         liveness[input_name] = []
@@ -105,14 +95,15 @@ def calculate_liveness(graph: GraphLowering) -> dict[str, list[int]]:
         rw = op_read_writes(op)
         for mem_dep in rw.reads | rw.writes:
             buf_name = mem_dep.name
-            if buf_name not in liveness:
-                liveness[buf_name] = []
-            liveness[buf_name].append(i)
+            uses = liveness.setdefault(buf_name, [])
+            # Ops are walked in order, so only the tail can repeat i.
+            if not uses or uses[-1] != i:
+                uses.append(i)
     return liveness
 
 
 def mem_usage_by_buf(
-    graph: GraphLowering | GraphView,
+    graph: GraphLowering,
     cache: Optional[dict] = None,
 ) -> dict:
     """
@@ -122,18 +113,29 @@ def mem_usage_by_buf(
     NOTE:
     if a buf is not in core_div_mismatch => it has no users => graph output
     """
-    num_cores_per_op = get_ncores_for_buffers(graph, cache)
+    # The mismatch reasons are surfaced by the residency path; here only the
+    # per-buffer core count (with -1 marking a mismatch) drives mem_usage.
+    num_cores_per_op, _ = get_ncores_for_buffers(graph, cache)
     mem_usage: dict = {}
 
-    buf_names = {op.name for op in graph.operations}
     for op in graph.operations:
         buf_name = op.name
         buf = graph.get_buffer(buf_name)
         num_cores = num_cores_per_op.get(buf_name, -1)
         rw = op_read_writes(op)
         layout = buf.layout
-        if isinstance(layout, MutationLayoutSHOULDREMOVE) or not isinstance(
-            op, ComputedBuffer
+        # Only ComputedBuffers backed by a real Spyre device layout
+        # (FixedTiledLayout, which carries ``device_layout``) can be sized for
+        # scratchpad/LX residency. Mutation aliases and plain host FixedLayout
+        # buffers (e.g. fallback / CPU-roundtrip outputs) have no device_layout,
+        # so they get the unsized sentinel below. Testing for FixedTiledLayout
+        # here — rather than the broader ``isinstance(layout, FixedLayout)`` —
+        # avoids excluding genuine device buffers, which subclass FixedLayout
+        # and must be sized (see the ``layout.device_layout`` access below).
+        if (
+            isinstance(layout, MutationLayoutSHOULDREMOVE)
+            or not isinstance(layout, FixedTiledLayout)
+            or not isinstance(op, ComputedBuffer)
         ):
             mem_usage[buf_name] = {
                 "size": -1,
@@ -141,7 +143,7 @@ def mem_usage_by_buf(
                 # below carries validity, so no arithmetic on num_cores here.
                 "size_per_core": -1,
                 "core_div_mismatch": num_cores < 0,
-                "op_inputs": [dep.name for dep in rw.reads if dep.name in buf_names],
+                "op_inputs": [dep.name for dep in rw.reads],
             }
             continue
         dev_layout = layout.device_layout
@@ -152,13 +154,13 @@ def mem_usage_by_buf(
             "size": dev_size,
             "size_per_core": dev_size // num_cores,
             "core_div_mismatch": num_cores < 0,
-            "op_inputs": [dep.name for dep in rw.reads if dep.name in buf_names],
+            "op_inputs": [dep.name for dep in rw.reads],
         }
 
     return mem_usage
 
 
-def buffer_not_read_in_full(graph: GraphLowering | GraphView, buf_name: str) -> bool:
+def buffer_not_read_in_full(graph: GraphLowering, buf_name: str) -> bool:
     """True if any consumer reads less than the whole ``buf_name`` (a sliced,
     partial, or multi-offset read), or if the footprint can't be proven to
     cover the full buffer.
@@ -212,6 +214,80 @@ def buffer_not_read_in_full(graph: GraphLowering | GraphView, buf_name: str) -> 
     return False
 
 
+def _is_tiled_advancing(op: Operation) -> bool:
+    """True if ``op``'s output advances its address across a coarse-tile loop.
+
+    LX addresses are never registered as ``affine.apply`` symbols in the SDSC
+    JSON (see ``compute_ops.py``'s ``is_tiled_lx`` check), so a buffer that
+    advances per loop iteration has no way to express its address change if
+    pinned to LX. This derives the same answer ``is_tiled_lx`` derives, but
+    earlier (at IR/allocation time) and directly from ``loop_info``, letting
+    the allocator exclude such buffers from LX candidacy up front instead of
+    crashing at codegen time.
+
+    Note this checks ``output_tiled_dims`` -- whether *this op's own write*
+    advances -- not ``loop_tiled_dims``, which only says the op is tiled at
+    all. A loop-internal buffer (e.g. drained by a copy op every iteration)
+    can be tiled yet have its own write pinned at a fixed address; such a
+    buffer is LX-eligible.
+    """
+    layout = getattr(op, "layout", None)
+    if not isinstance(layout, FixedTiledLayout):
+        return False
+    loop_info = getattr(op, "loop_info", None)
+    if loop_info is None:
+        return False
+    return any(dims for dims in loop_info.output_tiled_dims)
+
+
+def _is_read_advancing_anywhere(
+    name: str, buf_user_deps: dict[str, list[tuple[Operation, MemoryDep]]]
+) -> bool:
+    """True if some op reads buffer ``name`` via an advancing reference.
+
+    ``_is_tiled_advancing`` only asks whether ``name``'s own *producing*
+    write advances -- it says nothing about whether some other, unrelated
+    op *reads* ``name`` via a reference that advances across that reader's
+    own coarse-tile loop (e.g. a full HBM buffer with a fixed write, copied
+    into a nested tile every outer iteration). ``SpyreKernel.
+    _general_tile_advance`` derives a read reference's
+    ``device_tile_advance_expr`` from the *consuming* op's own
+    ``loop_info.tiled_dims_per_read``, not from the producer's
+    ``output_tiled_dims`` -- so a reader can advance even when the
+    producer's own write is fixed. ``compute_ops.py``'s ``is_tiled_lx``
+    check applies to every ``TensorArg`` (read and write) at codegen time,
+    so missing this at allocation time defers the same
+    ``NotImplementedError`` to codegen instead of routing the buffer to
+    HBM up front.
+
+    Mirrors ``_general_tile_advance``'s own positional dep-index matching:
+    for each reader op, ``name``'s occurrences among that op's
+    ``MemoryDep`` reads are matched in order to
+    ``loop_info.tiled_dims_per_read`` by position.
+    """
+    for reader_op, dep in buf_user_deps.get(name, []):
+        loop_info = getattr(reader_op, "loop_info", None)
+        if loop_info is None:
+            continue
+        read_deps = [
+            d for d in op_read_writes(reader_op).reads if isinstance(d, MemoryDep)
+        ]
+        if dep not in read_deps:
+            continue  # dep is name's write on this op, not a read
+        dep_idx = read_deps.index(dep)
+        if dep_idx >= len(loop_info.tiled_dims_per_read):
+            continue
+        # Mirrors _general_tile_advance's own per-level loop: a dep whose
+        # outer per-level list is non-empty but every level's own
+        # (dim, extent) list is empty (e.g. [[], []]) still advances by
+        # zero -- _general_tile_advance's `if not dim_extent_pairs:
+        # continue` never contributes a term for such a level, so the
+        # resulting device_tile_advance_expr is None, not merely small.
+        if any(loop_info.tiled_dims_per_read[dep_idx]):
+            return True
+    return False
+
+
 def _writes_at_constant_offset(op: Operation) -> bool:
     """True if ``op`` writes any buffer at a non-zero *constant* offset -- a
     sliced in-place mutation into a sub-region (e.g. ``x[:, 32:96] = ...``,
@@ -234,7 +310,7 @@ def _writes_at_constant_offset(op: Operation) -> bool:
 
 
 def ops_in_offset_mutation_component(
-    graph: GraphLowering | GraphView,
+    graph: GraphLowering,
 ) -> set[str]:
     """Names of ops data-connected to a sliced in-place mutation that writes at
     a constant non-zero offset (e.g. ``x[:, 32:96] = ...``).
@@ -298,7 +374,7 @@ def ops_in_offset_mutation_component(
     return component & op_names
 
 
-def get_buffer_users(graph: GraphLowering | GraphView) -> dict[str, list[Operation]]:
+def get_buffer_users(graph: GraphLowering) -> dict[str, list[Operation]]:
     buf_users_read_and_write: dict[str, list[Operation]] = {}
     for op in graph.operations:
         rw = op_read_writes(op)
@@ -309,7 +385,7 @@ def get_buffer_users(graph: GraphLowering | GraphView) -> dict[str, list[Operati
 
 
 def _get_buffer_user_deps(
-    graph: GraphLowering | GraphView,
+    graph: GraphLowering,
 ) -> dict[str, list[tuple[Operation, MemoryDep]]]:
     """Like get_buffer_users but pairs each op with the specific dep it uses.
 
@@ -340,25 +416,21 @@ def _op_num_cores(op: Operation) -> int:
 
 
 def get_ncores_for_buffers(
-    graph: GraphLowering | GraphView,
-    cache: Optional[dict] = None,
-    reject_reasons_out: Optional[dict[str, str]] = None,
-) -> dict[str, int]:
+    graph: GraphLowering, cache: Optional[dict] = None
+) -> tuple[dict[str, int], dict[str, str]]:
     """
-    Return a dictionary mapping buffer names to the number of cores
-    used by all the operations that uses the buffer.
-    If there is a core division mismatch return -1 instead of the
-    number of cores.
+    Return ``(num_cores, mismatch_reasons)``, where ``num_cores`` maps each
+    buffer name to the number of cores used by all the operations that use the
+    buffer (``-1`` on a core-division mismatch) and ``mismatch_reasons`` maps
+    each mismatched buffer name to a human-readable reason for the ``-1``.
 
     Pass an optional `cache` dict to memoize `_per_core_view_on_buf`
     results across calls (e.g. across co-opt search leaves). Safe to
     share only within a single graph, since the cache key includes the
     op name and `dep` (which carries the buffer name).
-
-    Pass an optional `reject_reasons_out` dict to receive detailed
-    reasons for core division mismatches (keyed by buffer name).
     """
     result: dict[str, int] = {}
+    mismatch_reasons_cache: dict[str, str] = {}
     using_multicore = config.sencores > 1
     buf_user_deps = _get_buffer_user_deps(graph)
     for buf_name, users in buf_user_deps.items():
@@ -421,8 +493,7 @@ def get_ncores_for_buffers(
                     break
             if mismatch_reason is not None:
                 num_cores = -1
-                if reject_reasons_out is not None:
-                    reject_reasons_out[buf_name] = mismatch_reason
+                mismatch_reasons_cache[buf_name] = mismatch_reason
             elif writer_cores is not None:
                 num_cores = writer_cores
             else:
@@ -434,7 +505,7 @@ def get_ncores_for_buffers(
         else:
             num_cores = 1
         result[buf_name] = num_cores
-    return result
+    return result, mismatch_reasons_cache
 
 
 class _GetLoadStoreIndices(WrapperHandler):
@@ -510,3 +581,116 @@ def _would_produce_lx_back_gap(
                 if device_size[d] > it_dim_size:
                     return True
     return False
+
+
+def plot_buffers(buffers: list[LifetimeBoundBuffer], max_height: int):
+    """Visualize a scratchpad allocation layout.
+
+    Allocated buffers are shown in blue; buffers that exceed the capacity
+    limit are shown in gray.  In-place parent/child pairs that share an
+    address are highlighted: a dark overlay spans the combined lifetime and
+    a green marker indicates the handoff tick.
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
+
+    name_to_index = {b.name: i for i, b in enumerate(buffers)}
+
+    fig, ax = plt.subplots()
+
+    for buffer in buffers:
+        addr = buffer.address
+        if addr is None:
+            continue
+        color = "b" if addr + buffer.size <= max_height else "lightgray"
+        rect = patches.Rectangle(
+            xy=(buffer.start_time, addr),
+            width=buffer.end_time - buffer.start_time,
+            height=buffer.size,
+            linewidth=0.3,
+            edgecolor="r",
+            facecolor=color,
+            fill=True,
+        )
+        ax.add_patch(rect)
+
+    for buffer in buffers:
+        addr = buffer.address
+        if addr is None:
+            continue
+        for p in buffer.in_place_parents:
+            pj = name_to_index.get(p)
+            if pj is None:
+                continue
+            parent = buffers[pj]
+            if parent.address is None:
+                continue
+            if addr == parent.address:
+                ax.add_patch(
+                    patches.Rectangle(
+                        xy=(parent.start_time, addr),
+                        width=buffer.end_time - parent.start_time,
+                        height=buffer.size,
+                        linewidth=0.3,
+                        edgecolor="r",
+                        facecolor="k",
+                        fill=True,
+                        alpha=0.25,
+                    )
+                )
+                ax.add_patch(
+                    patches.Rectangle(
+                        xy=(buffer.start_time, addr),
+                        width=1,
+                        height=buffer.size,
+                        linewidth=0.3,
+                        edgecolor="r",
+                        facecolor="g",
+                        fill=True,
+                    )
+                )
+
+    max_time = max((b.end_time for b in buffers), default=0)
+    ax.set_xlim(0, max_time)
+    ax.set_ylim(0, max_height)
+    return fig
+
+
+def quality_plot(
+    quality_logs: list[list[int]], temperature_logs: Optional[list[float]] = None
+):
+    """Plot quality (buffers allocated) over annealing steps.
+
+    Each run is drawn as a thin blue line; their smoothed average is drawn
+    in red.  When temperature data is available (typically recorded by
+    a method from an annealing schedule), the first run's temperature schedule is
+    overlaid on a log-scale right axis in green.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    fig, ax1 = plt.subplots()
+    for log in quality_logs:
+        ax1.plot(log, "b", lw=1, alpha=0.1)
+
+    if quality_logs:
+        average = np.array(quality_logs).mean(axis=0)
+        n_points = len(average)
+        if n_points >= 20:
+            n_smoothing = min(n_points // 10, 10)
+            smoothed = np.convolve(average, np.ones(n_smoothing) / n_smoothing, "valid")
+            ax1.plot(
+                [x + n_smoothing / 2 for x in range(len(smoothed))],
+                smoothed,
+                "r",
+                lw=3,
+            )
+        else:
+            ax1.plot(average, "r", lw=3)
+
+    if temperature_logs:
+        ax2 = ax1.twinx()
+        ax2.set_yscale("log")
+        ax2.plot(temperature_logs, "g", lw=1)
+
+    return fig

@@ -13,11 +13,11 @@
 # limitations under the License.
 
 
-from torch_spyre.constants import DEVICE_NAME
-
-from typing import Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from torch._dynamo.guards import GuardBuilder
+
+from torch_spyre.constants import DEVICE_NAME
 
 if TYPE_CHECKING:
     from torch_spyre._C import SpyreTensorLayout
@@ -152,10 +152,17 @@ def _patch_tensor_for_spyre():
                 ):
                     return self
                 else:
-                    return torch.ops.spyre.copy_from_d2d(self, dst)
+                    # Pass storage_offsets explicitly: a graph input's
+                    # storage_offset is dropped by Inductor, so the lowering
+                    # must re-introduce it in-graph (see copy_from_d2d in
+                    # customops.py and lower_spyre_from_d2d).
+                    return torch.ops.spyre.copy_from_d2d(
+                        self, dst, self.storage_offset(), dst.storage_offset()
+                    )
 
     def spyre_empty(
         *args,
+        size=None,
         device_layout=None,
         out=None,
         dtype=None,
@@ -165,6 +172,15 @@ def _patch_tensor_for_spyre():
         pin_memory=False,
         memory_format=torch.contiguous_format,
     ):
+        # torch.empty supports size as either a positional arg or keyword arg.
+        # Normalise so downstream always receives it as positional.
+        if size is not None:
+            if args:
+                raise TypeError(
+                    "empty() received an invalid combination of arguments - got (tuple, size=tuple)"
+                )
+            args = (size,)
+
         if (
             device_layout is None
         ):  # use original implementation if no layout is provided
@@ -193,6 +209,22 @@ def _patch_tensor_for_spyre():
     torch.Tensor.device_tensor_layout = device_tensor_layout
     torch.Tensor._spyre_tensor_patched = True
     torch.Tensor.to = spyre_to
+    # Dynamo cannot trace INTO the Python ``spyre_to``: it inlines the wrapper,
+    # hits the C++ ``orig_to`` call, and graph-breaks — forcing the whole region
+    # to run eager, where D2D dtype casts (e.g. fp16<->bf16) are wrong. Mark
+    # ``.to`` allow_in_graph so Dynamo treats it as a leaf and traces its tensor
+    # semantics (-> prims.convert_element_type) directly, keeping the region
+    # compiled. (An ``is_compiling()`` guard inside spyre_to does NOT help — the
+    # break fires on ``orig_to`` regardless of the branch taken.)
+    #
+    # Scope note: this is a process-global registration affecting every user of
+    # ``torch.Tensor.to``, not just Spyre. That is acceptable here because
+    # torch-spyre already monkey-patches ``torch.Tensor.to`` globally (line
+    # above), so this backend already owns ``.to``'s behavior in-process;
+    # marking it allow_in_graph only changes how Dynamo traces it (as a leaf),
+    # which is harmless for cpu/other-backend tensors (spyre_to falls through to
+    # ``orig_to`` semantics for them).
+    torch._dynamo.allow_in_graph(torch.Tensor.to)
     torch.empty = spyre_empty
 
     # ── Optimal weight loading (issue #1339) ──────────────
@@ -247,6 +279,71 @@ def _patch_tensor_for_spyre():
             [f"SpyreTensorLayout({guard.name}) == {expected_layout}"],
             guard.user_stack,
         )
+
+    # ── invoke_subgraph reuse support ────────────────────────────────────
+    # Because we replace GuardBuilder.TENSOR_MATCH, guards it builds report
+    # their type (via Guard.create_fn_name(), i.e. create_fn.__name__) as
+    # "_spyre_TENSOR_MATCH" rather than "TENSOR_MATCH". torch's
+    # invoke_subgraph subgraph-reuse path (torch._dynamo.variables.
+    # invoke_subgraph) looks each guard's type up in GUARD_VALUE_DISPATCH to
+    # re-evaluate it mid-trace; an unknown type there is a hard error
+    # ("subgraph_reuse: unsupported guard type ..."). So any use of
+    # torch.compiler.nested_compile_region would abort once this patch is
+    # installed.
+    #
+    # Register a spec under our name that mirrors stock TENSOR_MATCH's
+    # metadata check AND additionally compares SpyreTensorLayout, matching
+    # what the runtime lambda guard above actually enforces — so a subgraph
+    # is only reused when both the standard tensor metadata and the device
+    # layout still match. Guarded behind availability so older torch without
+    # the reuse machinery is unaffected.
+    try:
+        from torch._dynamo.guards import (
+            GUARD_VALUE_DISPATCH,
+            GuardCheckSpec,
+            extract_tensor_metadata,
+        )
+    except ImportError:
+        # torch predates invoke_subgraph reuse — nothing to register.
+        pass
+    else:
+
+        def _spyre_tensor_reuse_metadata(guard, value):
+            # Standard tensor metadata (shape/stride/dtype/device/
+            # requires_grad), plus the device layout for Spyre tensors
+            # (None otherwise). Mirrors extract_tensor_metadata so the
+            # comparison is identical to stock TENSOR_MATCH on the metadata
+            # axis.
+            layout = None
+            if getattr(value, "device", None) is not None and (
+                value.device.type == DEVICE_NAME
+            ):
+                layout = value.device_tensor_layout()
+            return (extract_tensor_metadata(value), layout)
+
+        def _spyre_tensor_reuse_eval(value, metadata):
+            base_metadata, expected_layout = metadata
+            if not isinstance(value, torch.Tensor):
+                return False
+            if extract_tensor_metadata(value) != base_metadata:
+                return False
+            # Layout only constrains Spyre tensors; mirror the runtime
+            # lambda guard: non-Spyre value OR layout matches.
+            if value.device.type != DEVICE_NAME:
+                return expected_layout is None
+            return value.device_tensor_layout() == expected_layout
+
+        _spyre_reuse_spec = GuardCheckSpec(
+            get_metadata_fn=_spyre_tensor_reuse_metadata,
+            eval_fn=_spyre_tensor_reuse_eval,
+        )
+        # Attach for the auto-dispatch scan, and register directly under the
+        # name Guard.create_fn_name() produces for guards this builder makes.
+        # GUARD_VALUE_DISPATCH is built once (at torch import, before this
+        # patch runs), so a direct insert is required — the scan does not
+        # re-run.
+        _spyre_TENSOR_MATCH.guard_check_spec = _spyre_reuse_spec
+        GUARD_VALUE_DISPATCH["_spyre_TENSOR_MATCH"] = _spyre_reuse_spec
 
     GuardBuilder.TENSOR_MATCH = _spyre_TENSOR_MATCH
     # ───────────────────FxGraph Cache Key Extension ───────────────────
