@@ -699,86 +699,69 @@ def bitwise_and(input1: torch.Tensor, input2: torch.Tensor) -> torch.Tensor:
         )
 
 
-# No native scan op on Spyre; implements cumsum via parallel prefix scan until #3388.
+# Spyre has no native scan op (issue #3388), so cumsum is decomposed as:
+#
+#   int32 / bool: integer add not supported on Spyre; CPU fallback, does not
+#   reach the steps below.
+#
+#   For fp16 and fp32:
+#   1. reshape_and_pad_via_cpu  — reshape to (A, n, B) and zero-pad to
+#      (A_scan, n_scan, B_scan) on CPU (avoids issue #3916).
+#   2. On-device scan:
+#      - fp16: tril(ones(n_scan, n_scan)) @ y_3d via BMM.
+#              A_scan = max(A, _CUMSUM_MIN_B) to meet the BMM batch requirement.
+#      - fp32: parallel prefix scan on dim=1 of (A_scan, n_scan, B_scan).
+#   3. slice_and_reshape_via_cpu  — remove padding and restore original shape on CPU.
+#   TODO: steps 1 and 3 can be replaced with inline ops once #3916 is fixed.
+
+# Minimum batch-dim size required by the Spyre bmm kernel.
+_CUMSUM_MIN_B = 4
+
+
 @register_spyre_decompositions([torch.ops.aten.cumsum.default])
 def spyre_cumsum(
     x: torch.Tensor,
     dim: int,
     dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
-    resolved_dtype = dtype if dtype is not None else x.dtype
-    if resolved_dtype in (torch.int32, torch.int64, torch.bool):
-        raise Unsupported(
-            f"spyre_cumsum: dtype {resolved_dtype} is not supported on Spyre; "
-            "only floating-point dtypes are supported"
-        )
-
     y = x if dtype is None else x.to(dtype)
+    if y.dtype not in (torch.float16, torch.float32):
+        # integer add not supported on Spyre; fall back to CPU.
+        return torch.ops.spyre.cumsum_cpu_fallback(y, dim % y.dim())
+
     ndim = y.dim()
     dim = dim % ndim  # normalise negative dim
     n = y.shape[dim]
+    _STICK = get_elem_in_stick(y.dtype)
 
-    if dim == ndim - 1:
-        # Last dim: scan via transpose onto dim=0 to avoid stick-alignment violations.
-        _MIN_B = 4
-        _STICK = 128 // y.element_size()  # elements per stick (128 bytes / dtype size)
-        B = y.numel() // n
-        B_orig = B
+    A = math.prod(list(y.shape[:dim]))  # dims before scan
+    B = math.prod(list(y.shape[dim + 1 :]))  # dims after scan
 
-        y_2d = y.reshape(B, n)
+    n_scan = math.ceil(n / _STICK) * _STICK
+    B_scan = max(_STICK, math.ceil(B / _STICK) * _STICK)  # at least one stick wide
 
-        if B < _MIN_B:
-            y_2d = torch.ops.aten.constant_pad_nd(y_2d, [0, 0, _MIN_B - B, 0], 0)
-            B = _MIN_B
+    A_scan = max(A, _CUMSUM_MIN_B) if y.dtype == torch.float16 else A
 
-        cf = torch.contiguous_format
+    y_3d = torch.ops.spyre.reshape_and_pad_via_cpu(
+        y, (A, n, B), (A_scan, n_scan, B_scan)
+    )
 
-        # Align B and n before transposing; B must be stick-aligned as the last dim.
-        B_scan = math.ceil(B / _STICK) * _STICK if B % _STICK != 0 else B
-        n_scan = math.ceil(n / _STICK) * _STICK if n > _STICK and n % _STICK != 0 else n
-        if B_scan != B or n_scan != n:
-            y_2d = torch.ops.aten.constant_pad_nd(
-                y_2d, [0, n_scan - n, 0, B_scan - B], 0
-            )
-
-        y_T = y_2d.transpose(0, 1).clone(memory_format=cf)  # (n_scan, B_scan)
-
-        # Parallel prefix scan; each pass doubles the scan reach.
+    if y.dtype == torch.float16:
+        L = torch.tril(torch.ones(n_scan, n_scan, dtype=y.dtype, device=y.device))
+        L_b = L.unsqueeze(0).expand(A_scan, -1, -1).clone()  # clone for a dense buffer
+        result = torch.ops.aten.bmm.default(L_b, y_3d)
+    else:
+        # fp32: prefix scan — each step adds a shifted copy of the running sum.
+        result = y_3d
         offset = 1
         while offset < n_scan:
-            sliced = torch.ops.aten.slice.Tensor(y_T, 0, 0, n_scan - offset)
-            shifted = torch.ops.aten.constant_pad_nd(sliced, [0, 0, offset, 0], 0)
-            y_T = y_T + shifted
+            sliced = torch.ops.aten.slice.Tensor(result, 1, 0, n_scan - offset)
+            # pad args: [l_d2, r_d2, l_d1, r_d1, l_d0, r_d0] — left-pad dim=1
+            shifted = torch.ops.aten.constant_pad_nd(sliced, [0, 0, offset, 0, 0, 0], 0)
+            result = result + shifted
             offset *= 2
 
-        if n_scan != n:
-            y_T = torch.ops.aten.slice.Tensor(y_T, 0, 0, n)  # (n, B_scan)
-
-        result = y_T.transpose(0, 1).clone(memory_format=cf)  # (B_scan, n)
-
-        if B_scan != B:
-            result = torch.ops.aten.slice.Tensor(result, 0, 0, B)
-
-        if B_orig < _MIN_B:
-            # Original rows are at the end; drop the zero rows prepended earlier.
-            result = torch.ops.aten.slice.Tensor(result, 0, B - B_orig, B)
-
-        return result.reshape(*y.shape[:-1], n)
-
-    # Non-last dim: scan directly on scan dim, no reshape needed.
-    # pad_idx locates `dim` in constant_pad_nd's reverse-order pad spec.
-    pad_idx = 2 * (ndim - 1 - dim)
-
-    offset = 1
-    while offset < n:
-        sliced = torch.ops.aten.slice.Tensor(y, dim, 0, n - offset)
-        pad = [0] * (2 * ndim)
-        pad[pad_idx] = offset
-        shifted = torch.ops.aten.constant_pad_nd(sliced, pad, 0)
-        y = y + shifted
-        offset *= 2
-
-    return y
+    return torch.ops.spyre.slice_and_reshape_via_cpu(result, (A, n, B), list(y.shape))
 
 
 #: Largest kernel tap (per spatial axis) the direct conv2d path accepts. A
