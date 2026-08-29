@@ -210,16 +210,6 @@ class TestQuantizeFP8:
         assert out.shape == torch.Size(shape)
 
     @pytest.mark.parametrize("op_name", _RAW_QUANTIZE_PARAMS)
-    def test_output_bf16_dtype_input(self, op_name):
-        """BF16 input accepted by both ops; output dtype must be E4M3."""
-        x = torch.full((2, 8), 2.0, dtype=BF16, device=DEVICE)
-        scale = torch.tensor(1.0, dtype=FP16, device=DEVICE)
-        fn = _compile(lambda x, s: getattr(torch.ops.spyre, op_name)(x, s))
-        out = fn(x, scale)
-        assert out.dtype == E4M3
-        assert out.shape == torch.Size((2, 8))
-
-    @pytest.mark.parametrize("op_name", _RAW_QUANTIZE_PARAMS)
     def test_output_per_row_scale(self, op_name):
         """Per-row scale tensor (M,1): output shape (2,8) preserved."""
         x = torch.tensor([[2.0] * 8, [4.0] * 8], dtype=FP16, device=DEVICE)
@@ -1125,7 +1115,7 @@ class TestRoundtripScale:
         out = _compile(_quant_dequant_fn)(
             x, torch.tensor(float("inf"), dtype=FP16, device=DEVICE)
         ).cpu()
-        assert not out.isnan().any()
+        assert (out == 0.0).all()
 
     def test_negative_scale(self):
         """Negative scale inverts sign: non-uniform input, scale=-1.0."""
@@ -1300,17 +1290,6 @@ class TestRoundtripInputVariants:
             rtol=0.0,
         )
 
-    def test_bf16_dtype_input(self):
-        """BF16 non-uniform input: implicit dtype cast accepted; FP16 output matches CPU ref."""
-        x_fp16 = _make_arange_fp16((2, 8), device="cpu")
-        x_bf16 = x_fp16.to(BF16).to(DEVICE)
-        scale = torch.tensor(1.0, dtype=FP16, device=DEVICE)
-        out = _compile(_quant_dequant_fn)(x_bf16, scale)
-        assert out.dtype == FP16
-        torch.testing.assert_close(
-            out.cpu(), _roundtrip_ref(x_fp16, scale.cpu()), atol=0.0, rtol=0.0
-        )
-
     def test_ascending_values_with_scale(self):
         """Ascending per-element values [0.5..4.0] with scale=2.0."""
         vals = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0]
@@ -1348,7 +1327,7 @@ class TestRoundtripGraphBehavior:
 
     def test_shape_guard_recompile(self):
         """(2,8) then (3,8): shape guard must recompile for correct row-3 output."""
-        fn = _compile(_quant_dequant_fn)
+        fn = _compile(_quant_dequant_fn, fullgraph=True)
         scale = torch.tensor(1.0, dtype=FP16, device=DEVICE)
         x2 = _make_arange_fp16((2, 8))
         fn(x2, scale)

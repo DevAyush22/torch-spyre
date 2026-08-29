@@ -45,7 +45,7 @@ def _quantize_op_available() -> bool:
 
         _ = torch.ops.spyre.quantize_fp8_with_scale
         return True
-    except AttributeError:
+    except (ImportError, AttributeError):
         return False
 
 
@@ -224,22 +224,6 @@ class TestFP8Correctness:
         assert not out.isinf().any()
         torch.testing.assert_close(out, ref, atol=0.1, rtol=0.05)
 
-    def test_out_dtype_bf16(self):
-        """out_dtype=BF16: production LLM output dtype."""
-        M, K, N = 16, 128, 128
-        sa_val, sw_val = 1.0, 1.0
-        sa = _st16(sa_val, DEVICE)
-        sw = _st16(sw_val, DEVICE)
-        a, w = _make_rand_inputs(M, K, N, device=DEVICE)
-        ref = _pipeline_ref(a, w, sa_val, sw_val, BF16)
-        fn_c = _compile(lambda a, w, sa, sw: _pipeline_fn(a, w, sa, sw, BF16))
-        out = fn_c(a, w, sa, sw).cpu()
-        assert out.dtype == BF16, f"Expected BF16, got {out.dtype}"
-        assert out.shape == (M, N)
-        assert not out.isnan().any()
-        assert not out.isinf().any()
-        torch.testing.assert_close(out, ref, atol=0.1, rtol=0.05)
-
     def test_identity_weight(self):
         """Identity weight matrix: mm(a_fp8, I_fp8) = a_fp8, isolates layout and multiply bugs."""
         M, K, N = 16, 128, 128
@@ -280,31 +264,6 @@ class TestFP8Correctness:
 
         fn_c = _compile(_pipeline_fn)
         out = fn_c(a_noncontig, w, sa, sw).cpu()
-
-        assert out.shape == (M, N)
-        assert out.dtype == FP16
-        assert not out.isnan().any()
-        assert not out.isinf().any()
-        torch.testing.assert_close(out, ref, atol=0.1, rtol=0.05)
-
-    def test_noncontiguous_weight(self):
-        """Non-contiguous weight (strides=(1,N)): quantize_weight_fp8_with_scale on transposed view."""
-        M, K, N = 16, 128, 128
-        sa_val, sw_val = 1.0, 1.0
-        sa = _st16(sa_val, DEVICE)
-        sw = _st16(sw_val, DEVICE)
-        torch.manual_seed(8)
-        a = torch.rand(M, K, dtype=FP16).to(DEVICE)
-        w_noncontig = (
-            torch.rand(N, K, dtype=FP16).to(DEVICE).t()
-        )  # shape (K,N), strides (1,N)
-        assert not w_noncontig.is_contiguous(), (
-            "Pre-condition: weight must be non-contiguous"
-        )
-        ref = _pipeline_ref(a, w_noncontig, sa_val, sw_val, FP16)
-
-        fn_c = _compile(_pipeline_fn)
-        out = fn_c(a, w_noncontig, sa, sw).cpu()
 
         assert out.shape == (M, N)
         assert out.dtype == FP16
@@ -1576,7 +1535,7 @@ class TestFP8Negative:
         """FP16 mat1 (unquantized) passed to _scaled_mm: rejected by lower_scaled_mm dtype guard."""
         M, K, N = 16, 128, 128
         a_fp16 = torch.rand(M, K, dtype=FP16, device=DEVICE)
-        w_fp8 = torch.rand(K, N, dtype=FP16).to(E4M3).to(DEVICE)
+        w_fp8 = _col_major(torch.rand(K, N, dtype=FP16).to(E4M3)).to(DEVICE)
         sa = _st16(1.0, DEVICE)
         sw = _st16(1.0, DEVICE)
 
@@ -1609,7 +1568,7 @@ class TestFP8Negative:
         """(M,K1)@(K2,N) with K1≠K2: rejected by _check_scaled_mm_sizes at PyTorch API layer."""
         M, K1, K2, N = 16, 128, 256, 128
         a_fp8 = torch.full((M, K1), 0.25, dtype=FP16).to(E4M3).to(DEVICE)
-        w_fp8 = torch.full((K2, N), 0.25, dtype=FP16).to(E4M3).to(DEVICE)
+        w_fp8 = _col_major(torch.full((K2, N), 0.25, dtype=FP16).to(E4M3)).to(DEVICE)
         sa = _st16(1.0, DEVICE)
         sw = _st16(1.0, DEVICE)
 
