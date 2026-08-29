@@ -70,6 +70,14 @@ class TestDatatypeScalarOperations:
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1228
         if tensor_dtype == torch.float64:
             pytest.xfail(reason="Spyre backend does not support dtype Double(FP64)")
+        # PT 2.12 promotes Tensor × np.float64 to FP64 in the compiled output
+        # rather than constant-folding to FP32, causing a segfault in the
+        # generated Spyre kernel. Xfail until the FP64-scalar handling is fixed.
+        if execution_mode == "compiled" and scalar_type is np.float64:
+            pytest.xfail(
+                reason="Spyre backend does not support FP64 scalar promotion under "
+                "torch.compile (PT 2.12). See issue #1228."
+            )
 
         def mixed_mul(x):
             if scalar_type == "python":
@@ -771,7 +779,10 @@ class TestNegativeScalarOperations:
             pytest.xfail(reason=f"Nested compile unsupported on Spyre path: {err}")
 
     def test_cpu_scalar_tensor_with_spyre_tensor(self, execution_mode):
-        """CPU scalar tensor × Spyre tensor should raise device mismatch error."""
+        """CPU scalar tensor x Spyre tensor should compute successfully: a single
+        non-write 0-dim CPU tensor is exempt from the device-mismatch check
+        (mirrors TensorIterator's ``allow_cpu_scalars_``; see
+        ``test_cross_device_scalar_op_allowed`` in ``tests/test_spyre.py``)."""
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1598
         if execution_mode == "compiled":
             pytest.xfail(
@@ -784,18 +795,7 @@ class TestNegativeScalarOperations:
 
         x = cached_randn((128, 128), dtype=torch.float16)
 
-        with pytest.raises(
-            (RuntimeError, torch._inductor.exc.InductorError)
-        ) as exc_info:
-            _compare_modes(
-                execution_mode, cpu_scalar_spyre_tensor, x, atol=1e-3, rtol=1e-3
-            )
-
-        error_msg = str(exc_info.value)
-        print(error_msg)
-        assert any(
-            kw in error_msg.lower() for kw in ["device", "layout", "cpu", "spyre"]
-        )
+        _compare_modes(execution_mode, cpu_scalar_spyre_tensor, x, atol=1e-3, rtol=1e-3)
 
     def test_cpu_tensor_with_spyre_tensor(self, execution_mode):
         """CPU regular tensor × Spyre tensor should raise device mismatch error."""

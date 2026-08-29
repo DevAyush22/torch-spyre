@@ -26,7 +26,7 @@ import torch
 from fms.models import get_model
 
 model = get_model("granite", "3.3-8b-instruct", device_type="spyre")
-compiled = torch.compile(model, backend="spyre")
+compiled = torch.compile(model)
 output = compiled(input_ids.to("spyre"))
 ```
 
@@ -613,9 +613,10 @@ as `add`, `relu`, and `sigmoid`, and matrix ops such as `mm` and `bmm`. Each nat
 single SuperDSC that references an existing Deeptools OpFunc.
 
 **Custom ops** are Spyre-specific ops that we register through `torch.library.custom_op`. The
-user-facing ops are `spyre::rms_norm`, `spyre::layer_norm`, `spyre::gelu`, `spyre::softplus`,
-`spyre::clamp`, `spyre::topkvalue`, `spyre::topkindex`, `spyre::full`, `spyre::ones_scalar`,
-`spyre::logical_not`, and `spyre::constant`. There are also a few infrastructure ops
+user-facing ops are `spyre::rms_norm`, `spyre::layer_norm`, `spyre::gelu`, `spyre::silu`,
+`spyre::softplus`, `spyre::clamp`, `spyre::topkvalue`, `spyre::topkindex`, `spyre::logical_not`,
+and `spyre::constant`. FP8 quantization adds `spyre::qfp8ch` and `spyre::qfp8wt`, which convert a
+tensor to the FP8 E4M3 format for a scaled matmul. There are also a few infrastructure ops
 (`restickify`, `overwrite`, and `copy_from_d2d`). Each custom op has a `@register_fake` for
 shape and dtype inference during tracing, along with a lowering rule that emits SuperDSCs. We
 need custom ops because the default PyTorch behavior is to decompose ops such as `rms_norm` into
@@ -632,10 +633,11 @@ scalar to a size-1 constant tensor. This runs at the LoopLevelIR level in
 `dedup_and_promote_constants`, which also deduplicates identical constants so they share one
 device buffer.
 
-**CPU fallbacks** cover the long tail. The current set is `embedding`, `arange`, `sin`, `cos`,
-`tril`, `triu`, `isin`, `normal_`, `argmax`, `bitwise_or`, `bitwise_xor`, and the int64 variants
-of `max`. The runtime automatically transfers data to the CPU, executes the op, and returns the
-result to Spyre. This is transparent to the model, but these ops are off the hot path.
+**CPU fallbacks** cover the long tail. The current set is `arange`, `cumsum`, `repeat`, `sin`,
+`cos`, `tril`, `triu`, `isin`, `where`, `index_copy`, `any`, `normal_`, `random_`, `argmax`,
+`argmin`, `bitwise_or`, `bitwise_xor`, and the int64 variants of `max` and `min`. The runtime
+automatically transfers data to the CPU, executes the op, and returns the result to Spyre. This
+is transparent to the model, but these ops are off the hot path.
 
 An ATen op flows through this pipeline in the following way. Decomposition rewrites it into
 either a native op or a custom op. Custom ops then lower to SuperDSCs built from native OpFuncs.
@@ -721,8 +723,11 @@ in proof-of-concept form. See [Scratchpad planning](../compiler/scratchpad_plann
 collectives (`scatter`, `reduce_scatter`, `alltoall`). See
 [Runtime — Multi-card and distributed execution](../runtime/index.md).
 
-**Profiling.** `torch.profiler` integration via `ProfilerActivity.PrivateUse1` is implemented
-in the in-progress `SpyreActivityProfiler` Kineto bridge. The memory APIs
+**Profiling.** The `SpyreActivityProfiler` Kineto bridge for `ProfilerActivity.PrivateUse1`
+device-side timing is in the tree (`torch_spyre/csrc/profiler/`) and builds by default. It uses
+upstream Kineto, which integrates with `libaiupti` through the PrivateUse1 profiler registration
+macros, so `torch.profiler` captures device-side kernel and transfer events without a separate
+wheel. The memory APIs
 (`torch.spyre.memory.memory_allocated` and friends) are available today, and
 `aiu-trace-analyzer` post-processes traces with PT-utilisation metrics. The
 [profiling RFC 0601](https://github.com/torch-spyre/rfcs/blob/main/0601-SpyreProfilingToolkit/0601-SpyreProfilingToolkitRFC.md)
@@ -774,7 +779,7 @@ used. The tables are organized by the challenge that each hook addresses.
 | `SpyreCCLBackend` | `c10d::Backend` (registered as `"spyreccl"`) | Multi-card collective communication via `torch.distributed` | `init_process_group(backend="spyreccl")`. Implements synchronous `send`, `recv`, `broadcast`, `barrier`, `gather`, `allgather`, `reduce`, `allreduce`. Reuses the rank's flex runtime instance and default stream. |
 
 Initialization is lazy and thread-safe. Importing `torch_spyre` registers the device name and
-module. `flex::initializeRuntime()` starts only on the first device use.
+module. `flex::RuntimeContext::create()` starts only on the first device use.
 
 ### Challenge 2: tiled tensor layout (FixedTiledLayout)
 
@@ -803,9 +808,9 @@ would require invasive core changes. Deferring to codegen is too late.
 | Mechanism | PyTorch Hook | Purpose | Key Detail |
 |---|---|---|---|
 | Native ops (Deeptools-supported) | Direct mapping to OpFuncs | Pointwise and matrix ops supported natively by the hardware | Pointwise: `add`, `sub`, `mul`, `truediv`, `relu`, `sigmoid`, `abs`, `neg`, `exp`, `log`, `sqrt`, `rsqrt`, `reciprocal`, `tanh`, `floor`, `eq`, `ne`, `ge`, `le`, `lt`, `gt`, `square`, `where`, `logical_and`, `to_dtype`, plus lowered forms of `clamp`/`gelu`/`softplus`/`layernormscale`/`layernormnorm`. Matrix: `mm`, `bmm` (`matmul` is decomposed to these by Inductor upstream). Matrix ops need custom layout propagation for the contracted dimension, but both kinds map to single SDSCs. |
-| `torch.library.custom_op` | Custom op registration | Layer 3 normalization, activation, and ops that need a single named lowering target | Each op requires `@register_fake` for shape/dtype inference during tracing, plus a lowering rule mapping to Spyre primitives. User-facing ops: `spyre::rms_norm`, `spyre::layer_norm`, `spyre::gelu`, `spyre::softplus`, `spyre::clamp`, `spyre::topkvalue`, `spyre::topkindex`, `spyre::full`, `spyre::ones_scalar`, `spyre::logical_not`, `spyre::constant`. Infrastructure ops: `spyre::restickify`, `spyre::overwrite` / `spyre::overwrite_f`, `spyre::copy_from_d2d`. |
-| Decompositions | Registered in `enable_spyre_context()` | Layer 4 ops not natively available | `logical_not` → `eq(input, ne(input, input))` (bool), `addmm` → `matmul+scale+add`, `linear` → `matmul+add` (with weight transpose), `rms_norm` → `spyre::rms_norm`, `layer_norm` → `spyre::layer_norm`, `gelu` → `spyre::gelu`, `softplus` → `spyre::softplus`, `topk` → `spyre::topkvalue`/`spyre::topkindex`, `max.dim` → split value/index decomp, `scaled_dot_product_attention` → explicit Q·K^T·V, `cat`, `constant_pad_nd`, `ones` → `spyre::ones_scalar+expand+clone`, `new_ones`, `full` → `spyre::full`, `bitwise_not`, `bitwise_and` |
-| CPU fallback (auto-transfer) | PyTorch fallback dispatch | Infrequent ops that are off the critical path | `embedding`, `arange`, `sin`, `cos`, `tril`, `triu`, `isin`, `normal_`, `argmax`, `bitwise_or`, `bitwise_xor`, int64 variants of `max`. Data auto-transfers to the CPU, executes, and returns to Spyre. Transparent to the model. |
+| `torch.library.custom_op` | Custom op registration | Layer 3 normalization, activation, quantization, and ops that need a single named lowering target | Each op requires `@register_fake` for shape/dtype inference during tracing, plus a lowering rule mapping to Spyre primitives. User-facing ops: `spyre::rms_norm`, `spyre::layer_norm`, `spyre::gelu`, `spyre::silu`, `spyre::softplus`, `spyre::clamp`, `spyre::topkvalue`, `spyre::topkindex`, `spyre::logical_not`, `spyre::constant`. FP8 quantization: `spyre::qfp8ch`, `spyre::qfp8wt` (E4M3 format conversion), and `spyre::scaled_mm` (the raw FP8 matmul that `torch._scaled_mm` decomposes onto). Infrastructure ops: `spyre::restickify`, `spyre::overwrite` / `spyre::overwrite_f`, `spyre::copy_from_d2d`. |
+| Decompositions | Registered in `enable_spyre_context()` | Layer 4 ops not natively available | `logical_not` → `eq(input, ne(input, input))` (bool), `addmm` → `matmul+scale+add`, `linear` → `matmul+add` (with weight transpose), `rms_norm` → `spyre::rms_norm`, `layer_norm` → `spyre::layer_norm`, `gelu` → `spyre::gelu`, `softplus` → `spyre::softplus`, `topk` → `spyre::topkvalue`/`spyre::topkindex`, `max.dim` → split value/index decomp, `scaled_dot_product_attention` → explicit Q·K^T·V, `cat`, `constant_pad_nd`, `ones`/`new_ones` → `full`, `bitwise_not`, `bitwise_and`, `flip` → `index_select` with a descending index (reversing the last stick dimension raises), `masked_scatter` → whole-row gather (the mask must broadcast along the last dimension). `torch._scaled_mm` decomposes to `spyre::scaled_mm` (the raw FP8 matmul) followed by the `scale_a` and `scale_b` multiplies and the `bias` add. |
+| CPU fallback (auto-transfer) | PyTorch fallback dispatch | Infrequent ops that are off the critical path | `arange`, `cumsum`, `repeat`, `sin`, `cos`, `tril`, `triu`, `isin`, `where`, `index_copy`, `any`, `normal_`, `random_`, `argmax`, `argmin`, `bitwise_or`, `bitwise_xor`, int64 variants of `max` and `min`. Data auto-transfers to the CPU, executes, and returns to Spyre. Transparent to the model. |
 
 ### Profiling
 
@@ -814,7 +819,7 @@ would require invasive core changes. Deferring to codegen is too late.
 | `torch.spyre.memory.*` | `torch.accelerator.memory` re-export | Per-device memory queries | `memory_allocated`, `max_memory_allocated`, `reset_peak_memory_stats`, `memory_stats` — all available today. |
 | `aiu-smi` | Standalone CLI / sampler | Power, thermal, PT-utilisation, DDR / PCIe / RDMA bandwidth | Available in PF and VF mode (Z/LinuxONE rollout in progress for VF). Public release tracked in [#1335](https://github.com/torch-spyre/torch-spyre/issues/1335). |
 | `aiu-trace-analyzer` | Trace post-processor | Adds derived metrics (PT-Util %) to Chrome / Perfetto traces | Available with some known gaps. |
-| `SpyreActivityProfiler` (Kineto bridge) | `ProfilerActivity.PrivateUse1` | Device-side kernel timing into `torch.profiler` traces | In progress in [#1856](https://github.com/torch-spyre/torch-spyre/pull/1856). The full design is in [profiling RFC 0601](https://github.com/torch-spyre/rfcs/blob/main/0601-SpyreProfilingToolkit/0601-SpyreProfilingToolkitRFC.md). |
+| `SpyreActivityProfiler` (Kineto bridge) | `ProfilerActivity.PrivateUse1` | Device-side kernel timing into `torch.profiler` traces | Merged in [#1856](https://github.com/torch-spyre/torch-spyre/pull/1856) and built by default via upstream Kineto and `libaiupti`. The full design is in [profiling RFC 0601](https://github.com/torch-spyre/rfcs/blob/main/0601-SpyreProfilingToolkit/0601-SpyreProfilingToolkitRFC.md). |
 
 ---
 

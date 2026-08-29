@@ -21,91 +21,33 @@ from torch._inductor.codegen.wrapper import (
     SubgraphPythonWrapperCodegen,
 )
 from torch._inductor.ir import GraphPartitionSignature
-from torch._inductor.utils import ValueWithLineMap
 from torch._inductor.virtualized import V
 from torch._inductor.sizevars import SizeVarAllocator
 
+from .errors import Unsupported
 from .ir import FixedTiledLayout
-from .constants import SEGMENT_SIZE
 
 
-class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
-    def __init__(self):
-        super().__init__()
+class _SpyreWrapperCodegenMixin(PythonWrapperCodegen):
+    """Spyre wrapper-codegen behavior shared by the top-level graph wrapper and
+    the invoke_subgraph wrapper.
+
+    These overrides are about *how a Spyre buffer/op is emitted* (device-layout
+    allocation, HBM-pool reuse/free, constant-tensor fallback). They are
+    graph-role-agnostic, so both the parent graph and a nested_compile_region
+    subgraph need them. Role-specific behavior (header emission, benchmark
+    harness, launcher naming) is NOT here — it stays on the concrete wrapper
+    classes, so a subgraph keeps the stock ``write_header = pass`` and does not
+    double-emit imports.
+    """
+
+    def _patch_sizevars(self) -> None:
+        # Spyre device layout is not fully visible to Inductor, so its loop
+        # simplification would be wrong (see noop_simplify_loops_impl). Applied
+        # per GraphLowering, so the subgraph's own sizevars is patched too.
         V.graph.sizevars._simplify_loops_impl = noop_simplify_loops_impl.__get__(
             V.graph.sizevars, SizeVarAllocator
         )
-
-    @staticmethod
-    def create(
-        is_subgraph: bool,
-        subgraph_name: Optional[str],
-        parent_wrapper: Optional[PythonWrapperCodegen],
-        partition_signatures: Optional[GraphPartitionSignature] = None,
-    ):
-        if is_subgraph:
-            assert subgraph_name is not None
-            assert parent_wrapper is not None
-            return SubgraphPythonWrapperCodegen(
-                subgraph_name, parent_wrapper, partition_signatures
-            )
-        return SpyrePythonWrapperCodegen()
-
-    def write_header(self) -> None:
-        super().write_header()
-        self.imports.splice(
-            """
-                from sympy import sympify
-                from torch_spyre._inductor.op_spec import TensorArg, OpSpec, UnimplementedOp, LoopSpec, spyre_constant_tensor, IndirectAccess
-                from torch_spyre.execution.async_compile import SpyreAsyncCompile
-                from torch_spyre._C import DataFormats, ElementArrangement, SpyreTensorLayout, spyre_empty_with_layout, set_spyre_tensor_layout
-                import subprocess
-            """,
-            strip=True,
-        )
-        self.header.writeline(
-            "from torch_spyre._C import reinterpret_tensor as reinterpret_tensor"
-        )
-        self.header.writeline(
-            "from torch_spyre._C import reinterpret_tensor_with_layout"
-        )
-        self.header.writeline("del async_compile")
-        self.header.writeline("async_compile = SpyreAsyncCompile()")
-
-    def generate(self, is_inference):
-        """Override to add pool allocation/deallocation around kernel calls."""
-        result_tuple = super().generate(is_inference)
-        wrapper_value_with_linemap, kernel_decls = result_tuple
-
-        pool_size = getattr(V.graph, "pool_size", 0)
-        if pool_size > 0:
-            wrapper_str = str(wrapper_value_with_linemap.value)
-
-            # Inject pool allocation before kernel calls and cleanup before return.
-            lines = wrapper_str.split("\n")
-
-            # Add `del _pool` before `return (` statement.
-            for i in range(len(lines) - 1, -1, -1):
-                line = lines[i].strip()
-                if line.startswith("return ("):
-                    indent = len(lines[i]) - len(lines[i].lstrip())
-                    lines.insert(i, " " * indent + "del _pool")
-                    break
-
-            # Add pool allocation before first kernel call (`.run(`).
-            pool_alloc_code = self.allocate_pool()
-            for i, line in enumerate(lines):
-                if ".run(" in line:
-                    indent = len(line) - len(line.lstrip())
-                    lines.insert(i, " " * indent + pool_alloc_code)
-                    break
-
-            wrapper_str = "\n".join(lines)
-            wrapper_value_with_linemap = ValueWithLineMap(
-                value=wrapper_str, line_map=wrapper_value_with_linemap.line_map
-            )
-
-        return (wrapper_value_with_linemap, kernel_decls)
 
     def make_buffer_allocation(self, buffer: BufferLike):
         layout = buffer.get_layout()
@@ -134,12 +76,12 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
             f'{node.get_name()} = spyre_constant_tensor({value}, torch.device("{device}"), {dtype})'
         )
 
-    def _is_pool_buffer(self, buffer: BufferLike) -> bool:
+    def _is_hbm_pool_buffer(self, buffer: BufferLike) -> bool:
         layout = buffer.get_layout()
-        return isinstance(layout, FixedTiledLayout) and "pool" in layout.allocation
+        return isinstance(layout, FixedTiledLayout) and "hbm_pool" in layout.allocation
 
     def codegen_free_buffer(self, buffer: BufferLike) -> None:
-        if not self._is_pool_buffer(buffer):
+        if not self._is_hbm_pool_buffer(buffer):
             super().codegen_free_buffer(buffer)
 
     def make_buffer_reuse(self, old: BufferLike, new: BufferLike, delete_old: bool):
@@ -150,23 +92,97 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
         if old_name not in V.graph.get_output_names() and delete_old:
             del_line = f"; {self.make_buffer_free(old)}"
 
-        if old.get_size() == new.get_size() and old.get_stride() == new.get_stride():
+        new_offset = new.get_layout().offset or 0
+        old_offset = old.get_layout().offset or 0
+        if (
+            old.get_size() == new.get_size()
+            and old.get_stride() == new.get_stride()
+            and old_offset == new_offset
+        ):
             return self.codegen_exact_buffer_reuse(old_name, new_name, del_line)
 
         new_stl = new.get_layout().device_layout
-        reinterpret_view = f"reinterpret_tensor_with_layout({old_name}, {new.get_size()}, {new.get_stride()}, 0, {new_stl!r})"
+        # reinterpret_tensor_with_layout's offset arg is added to old_name's
+        # *current* runtime storage_offset (see spyre_views.cpp), not treated
+        # as an absolute target. Passing old's offset directly double-counts
+        # it; the delta to new's offset is what actually shifts to the right
+        # place.
+        offset_increment = new_offset - old_offset
+        # Static-shape paths only: a symbolic offset would render a bare
+        # sympy expression into the generated source below.
+        if getattr(offset_increment, "free_symbols", None):
+            raise Unsupported(
+                f"symbolic storage_offset not supported in buffer-reuse codegen: "
+                f"{offset_increment!r}"
+            )
+        reinterpret_view = f"reinterpret_tensor_with_layout({old_name}, {new.get_size()}, {new.get_stride()}, {offset_increment}, {new_stl!r})"
         return f"{self.declare}{new_name} = {reinterpret_view}{del_line}  {self.comment} reuse"
 
-    def allocate_pool(self):
-        """Allocate the intermediate pool."""
-        pool_size_bytes = getattr(V.graph, "pool_size", SEGMENT_SIZE)
-        pool_size_sticks = (pool_size_bytes + 127) // 128
-        return (
-            f"_pool = spyre_empty_with_layout("
-            f"({pool_size_sticks},), (1,), "
-            f"torch.uint8, SpyreTensorLayout(device_size=[{pool_size_sticks}, 1, 1], "
-            f"stride_map=[1, 1, 1], device_dtype=DataFormats.SENINT8))"
+
+class SpyrePythonWrapperCodegen(_SpyreWrapperCodegenMixin, PythonWrapperCodegen):
+    def __init__(self):
+        super().__init__()
+        self._patch_sizevars()
+
+    @staticmethod
+    def create(
+        is_subgraph: bool,
+        subgraph_name: Optional[str],
+        parent_wrapper: Optional[PythonWrapperCodegen],
+        partition_signatures: Optional[GraphPartitionSignature] = None,
+    ):
+        if is_subgraph:
+            assert subgraph_name is not None
+            assert parent_wrapper is not None
+            return SpyreSubgraphPythonWrapperCodegen(
+                subgraph_name, parent_wrapper, partition_signatures
+            )
+        return SpyrePythonWrapperCodegen()
+
+    def write_header(self) -> None:
+        super().write_header()
+        self.imports.splice(
+            """
+                from sympy import sympify
+                from torch_spyre._inductor.op_spec import TensorArg, TensorWorkDivision, OpSpec, UnimplementedOp, LoopSpec, spyre_constant_tensor, IndirectAccess, DebugHandle, SourceLoc, ProvenanceTransform
+                from torch_spyre.execution.async_compile import SpyreAsyncCompile
+                from torch_spyre._C import DataFormats, ElementArrangement, SpyreTensorLayout, spyre_empty_with_layout, set_spyre_tensor_layout
+                import subprocess
+            """,
+            strip=True,
         )
+        self.header.writeline(
+            "from torch_spyre._C import reinterpret_tensor as reinterpret_tensor"
+        )
+        self.header.writeline(
+            "from torch_spyre._C import reinterpret_tensor_with_layout"
+        )
+        self.header.writeline("del async_compile")
+        self.header.writeline("async_compile = SpyreAsyncCompile()")
+
+
+class SpyreSubgraphPythonWrapperCodegen(
+    _SpyreWrapperCodegenMixin, SubgraphPythonWrapperCodegen
+):
+    """Spyre wrapper for an invoke_subgraph body (e.g. a nested_compile_region
+    decoder block reused across layers).
+
+    Inherits the stock subgraph plumbing (launcher naming, empty ``write_header``
+    so imports are not re-emitted, input/output signature handling) from
+    ``SubgraphPythonWrapperCodegen`` and layers the Spyre buffer/op codegen on
+    top via the mixin. Without this, subgraph codegen fell back to the stock
+    wrapper and hit ``AttributeError`` the moment it emitted a Spyre buffer
+    (e.g. a SpyreConstantFallback materialized by split_multi_ops).
+    """
+
+    def __init__(
+        self,
+        subgraph_name: str,
+        parent_wrapper: PythonWrapperCodegen,
+        partition_signatures: Optional[GraphPartitionSignature] = None,
+    ):
+        super().__init__(subgraph_name, parent_wrapper, partition_signatures)
+        self._patch_sizevars()
 
 
 def noop_simplify_loops_impl(

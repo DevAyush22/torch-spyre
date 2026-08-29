@@ -20,10 +20,13 @@ import regex as re
 import sympy
 
 import torch
+import torch.compiler
 import torch.fx.traceback
+from torch._dynamo.symbolic_convert import InstructionTranslator
 from torch._inductor.ir import Operation
 
 from .logging_utils import get_inductor_logger
+from .patches import OBSERVER_HOOKS_KEY
 
 logger = get_inductor_logger("propagate_hints")
 
@@ -54,22 +57,40 @@ class DimHint:
 
 
 _HINT_RE = re.compile(r"^_hint_(\d+)$")
-_hint_counter = 0
+
+
+@torch.compiler.allow_in_graph
+def get_id():
+    """Returns a new hint ID each time it is called
+
+    The IDs are generated per compilation session
+    and always start on 0 and are incremented by one.
+    The dependency to a global counter is hidden by
+    `allow_in_graph` and this call is removed by
+    dead code elimination because the counter is not
+    used for any computation. The counter is thread
+    local.
+    """
+
+    tx = InstructionTranslator.current_tx()
+    assert tx is not None
+
+    counter = getattr(tx, "__spyre_hint_counter", 0)
+    setattr(tx, "__spyre_hint_counter", counter + 1)
+
+    # returning a tensor is required for allow_in_graph
+    return counter, torch.empty(0, device="cpu")
 
 
 def spyre_hint(**kwargs: Any):
     """
     Attach a hint and a unique hint id to every FX node in scope.
     """
-    global _hint_counter
-
-    _hint_counter += 1
-    return torch.fx.traceback.annotate({f"_hint_{_hint_counter}": kwargs})
-
-
-def _reset_counter(*args, **kwargs):
-    global _hint_counter
-    _hint_counter = 0
+    if torch.compiler.is_compiling():
+        _id, _ = get_id()
+    else:
+        _id = 0
+    return torch.fx.traceback.annotate({f"_hint_{_id}": kwargs})
 
 
 def get_op_hints(op: Operation) -> dict[int, dict[str, Any]]:
@@ -93,6 +114,27 @@ def get_op_hints(op: Operation) -> dict[int, dict[str, Any]]:
     return hints
 
 
+def log_new_nodes(node: torch.fx.Node):
+    if (
+        node.graph.owning_module is not None
+        and (meta := node.graph.owning_module.meta.get(OBSERVER_HOOKS_KEY)) is not None
+    ):
+        _pass = meta["pass"]
+        subsystem = meta["subsystem"]
+    else:
+        _pass = "unknown"
+        subsystem = "unknown"
+
+    logger.debug(
+        "Post-grad insertion of node %s with target %s detected after"
+        " pass %s, subsystem %s. Spyre hints could be invalidated.",
+        node.name,
+        node.target,
+        _pass,
+        subsystem,
+    )
+
+
 def collect_spyre_hints(graph: torch.fx.Graph) -> None:
     """
     Snapshot call_function nodes' (target, custom-meta) by topological position.
@@ -106,11 +148,16 @@ def collect_spyre_hints(graph: torch.fx.Graph) -> None:
     """
     assert graph.owning_module is not None
 
-    graph.owning_module.meta["__spyre_dim_hints"] = [
-        (node.target, node.meta.get("custom"))
-        for node in graph.nodes
-        if node.op == "call_function"
-    ]
+    # post_grad_custom_pre_pass is called twice
+    if graph.owning_module.meta.get("__spyre_dim_hints") is None:
+        graph.owning_module._register_create_node_hook(log_new_nodes)
+
+        snapshot = [
+            (node.target, node.meta.get("custom"))
+            for node in graph.nodes
+            if node.op == "call_function"
+        ]
+        graph.owning_module.meta["__spyre_dim_hints"] = snapshot
 
 
 def recover_spyre_hints(graph: torch.fx.Graph) -> None:
@@ -118,27 +165,50 @@ def recover_spyre_hints(graph: torch.fx.Graph) -> None:
     Restore custom meta on AOT-renamed call_function nodes by aligning the
     snapshot from collect_spyre_hints against the current graph on ``target``.
 
-    A simple positional zip is not robust: passes running between collect and
-    recover can insert nodes, most commonly by un-sharing a producer feeding a
-    pointwise op (``add(mm, mm)`` becomes two distinct ``aten.mm.default`` nodes).
-    We instead walk both sequences with a single cursor: a node whose target
-    matches the next snapshot entry consumes it; a node whose target repeats the
-    last consumed entry is treated as a duplicate of that computation and inherits
-    the same hint. This keeps alignment intact across such insertions, where the
-    old count check would bail and silently drop every hint.
+    Passes running between collect and recover can both insert nodes (e.g.
+    decompose_auto_functionalized inserts copy_forced_default) and delete/replace
+    nodes (e.g. auto_functionalized_v2 is replaced). The algorithm must handle
+    both cases:
+
+    - Inserted nodes (in graph, not in snapshot): skip the node, leave it
+      with whatever meta["custom"] it already has.
+    - Deleted nodes (in snapshot, not in graph): skip past the snapshot entry
+      to stay aligned with the graph.
+
+    We implement this as a forward scan: for each graph node, scan forward in
+    the snapshot (from the current cursor) looking for a matching target. If
+    found, consume all snapshot entries up to and including it. If not found,
+    the node was inserted after the snapshot — leave it untouched. A node
+    whose target repeats the last consumed entry is a duplicate (e.g. the
+    second mm in add(mm, mm)) and inherits the same hint.
     """
-    _dim_hints = graph.owning_module.meta["__spyre_dim_hints"]
+
+    assert graph.owning_module is not None
+
+    if log_new_nodes in graph.owning_module._create_node_hooks:
+        graph.owning_module._unregister_create_node_hook(log_new_nodes)
+
+    _dim_hints = graph.owning_module.meta.pop("__spyre_dim_hints")
     nodes = [n for n in graph.nodes if n.op == "call_function"]
 
     cursor = 0
     last_target = None
     last_custom = None
+    matched = 0
     for node in nodes:
         custom = None
-        if cursor < len(_dim_hints) and _dim_hints[cursor][0] == node.target:
-            last_target, last_custom = _dim_hints[cursor]
+        # Scan snapshot forward to find a matching entry for this node.
+        found_at = None
+        for i in range(cursor, len(_dim_hints)):
+            if _dim_hints[i][0] == node.target:
+                found_at = i
+                break
+        if found_at is not None:
+            # Advance cursor past all skipped (deleted) entries and this one.
+            cursor = found_at + 1
+            last_target, last_custom = _dim_hints[found_at]
             custom = last_custom
-            cursor += 1
+            matched += 1
         elif node.target == last_target:
             # Duplicate of the just-consumed snapshot node (same computation,
             # e.g. the second mm in add(mm, mm)); reuse its hint.
@@ -150,8 +220,13 @@ def recover_spyre_hints(graph: torch.fx.Graph) -> None:
             node.meta["custom"] = {}
         node.meta["custom"].update(custom)
 
-    if cursor != len(_dim_hints):
-        logger.warning(
-            f"Warning: unable to recover spyre hints "
-            f"(matched {cursor}/{len(_dim_hints)} snapshot entries)"
+    # Count hints that actually carry data (None custom = unhinted node).
+    hinted = sum(1 for _, c in _dim_hints if c)
+    if matched < hinted:
+        logger.debug(
+            "recover_spyre_hints: matched %d/%d hinted snapshot entries; "
+            "%d entries were for nodes removed by post-grad passes.",
+            matched,
+            hinted,
+            hinted - matched,
         )

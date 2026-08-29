@@ -15,20 +15,20 @@
 # Owner(s): ["module: cpp"]
 
 import os
-import regex as re
-import psutil
 import warnings
 from contextlib import contextmanager
-import pytest
 
+import psutil
+import pytest
+import regex as re
 import torch
 from torch.testing._internal.common_utils import (
+    TestCase,
     instantiate_parametrized_tests,
     parametrize,
     run_tests,
     set_warn_always_context,
     subtest,
-    TestCase,
 )
 
 # 0-dim scalar roundtrip: shared dtype × factory lambdas (used by parametrized fill test).
@@ -110,6 +110,22 @@ class TestSpyre(TestCase):
         with torch.device("spyre"):
             a = torch.empty(50, dtype=torch.float16)
         self.assertEqual(a.device.type, "spyre")
+
+    def test_empty_size_arguments(self):
+        # Positional size argument
+        a = torch.empty((2, 3), device="spyre", dtype=torch.float16)
+        self.assertEqual(tuple(a.shape), (2, 3))
+
+        # Keyword size argument
+        a = torch.empty(size=(2, 3), device="spyre", dtype=torch.float16)
+        self.assertEqual(tuple(a.shape), (2, 3))
+
+        # Both positonal and keyword size arguments
+        with pytest.raises(
+            TypeError,
+            match="received an invalid combination of arguments",
+        ):
+            torch.empty((2, 3), size=(2, 3), device="spyre", dtype=torch.float16)
 
     def test_ones_factory(self):
         a = torch.ones(50, device="spyre", dtype=torch.float16)
@@ -366,6 +382,36 @@ class TestSpyre(TestCase):
                 x, expect_warning=dtype in dtypes_with_downcast_warning
             )
             self._assert_roundtrip_close(x, x_cpu, dtype)
+
+    def test_cross_device_inplace_error_msg(self):
+        # Mirrors upstream test_cross_device_inplace_error_msg: the CPU tensor is the write target, so it must raise despite the scalar exemption below.
+        a = torch.tensor(2.0)
+        b = torch.tensor(2.0, device="spyre")
+        with self.assertRaisesRegex(
+            RuntimeError, "Expected all tensors to be on the same device"
+        ):
+            a += b
+
+    def test_cross_device_scalar_op_allowed(self):
+        # A single 0-dim CPU tensor as a non-write operand may mix with a spyre tensor (TensorIterator's allow_cpu_scalars_ exemption).
+        spyre_t = torch.tensor(2.0, device="spyre")
+        cpu_scalar = torch.tensor(3.0)
+
+        result = spyre_t + cpu_scalar
+        self.assertEqual(result.device.type, "spyre")
+        self.assertEqual(result.to("cpu"), torch.tensor(5.0))
+
+        spyre_t += cpu_scalar
+        self.assertEqual(spyre_t.to("cpu"), torch.tensor(5.0))
+
+    def test_cross_device_nonscalar_op_rejected(self):
+        # The CPU-scalar exemption only covers 0-dim tensors; a non-scalar CPU tensor must still raise.
+        spyre_t = torch.tensor([1.0, 2.0], device="spyre")
+        cpu_t = torch.tensor([1.0, 2.0])
+        with self.assertRaisesRegex(
+            RuntimeError, "Expected all tensors to be on the same device"
+        ):
+            spyre_t + cpu_t
 
     @pytest.mark.xfail(reason="data-dependent output not supported", strict=True)
     def test_data_dependent_output(self):
@@ -709,6 +755,12 @@ class TestSpyre(TestCase):
             (torch.float32, torch.float16),
         }
 
+        # DCI doesn't support either direction for these conversions.
+        skip_eager_conversions = {
+            (torch.float32, torch.int32),
+            (torch.int32, torch.float32),
+        }
+
         # Test supported conversions
         for src_dtype, dst_dtype in DtypeOpTable.get_table().keys():
             # Skip all FP8 conversions in eager mode - backend doesn't support them:
@@ -721,6 +773,9 @@ class TestSpyre(TestCase):
                 torch.float8_e4m3fn,
                 torch.float8_e5m2,
             ):
+                continue
+
+            if (src_dtype, dst_dtype) in skip_eager_conversions:
                 continue
 
             ctx = f"H2D {src_dtype}->{dst_dtype}"
@@ -750,6 +805,7 @@ class TestSpyre(TestCase):
             (torch.int8, torch.float16),
             (torch.float32, torch.int32),
             (torch.float16, torch.int64),
+            (torch.int32, torch.float32),
         ]
 
         for src_dtype, dst_dtype in unsupported_pairs:

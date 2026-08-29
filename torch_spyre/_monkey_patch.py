@@ -13,11 +13,11 @@
 # limitations under the License.
 
 
-from torch_spyre.constants import DEVICE_NAME
-
-from typing import Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from torch._dynamo.guards import GuardBuilder
+
+from torch_spyre.constants import DEVICE_NAME
 
 if TYPE_CHECKING:
     from torch_spyre._C import SpyreTensorLayout
@@ -152,10 +152,17 @@ def _patch_tensor_for_spyre():
                 ):
                     return self
                 else:
-                    return torch.ops.spyre.copy_from_d2d(self, dst)
+                    # Pass storage_offsets explicitly: a graph input's
+                    # storage_offset is dropped by Inductor, so the lowering
+                    # must re-introduce it in-graph (see copy_from_d2d in
+                    # customops.py and lower_spyre_from_d2d).
+                    return torch.ops.spyre.copy_from_d2d(
+                        self, dst, self.storage_offset(), dst.storage_offset()
+                    )
 
     def spyre_empty(
         *args,
+        size=None,
         device_layout=None,
         out=None,
         dtype=None,
@@ -165,6 +172,15 @@ def _patch_tensor_for_spyre():
         pin_memory=False,
         memory_format=torch.contiguous_format,
     ):
+        # torch.empty supports size as either a positional arg or keyword arg.
+        # Normalise so downstream always receives it as positional.
+        if size is not None:
+            if args:
+                raise TypeError(
+                    "empty() received an invalid combination of arguments - got (tuple, size=tuple)"
+                )
+            args = (size,)
+
         if (
             device_layout is None
         ):  # use original implementation if no layout is provided
@@ -193,6 +209,22 @@ def _patch_tensor_for_spyre():
     torch.Tensor.device_tensor_layout = device_tensor_layout
     torch.Tensor._spyre_tensor_patched = True
     torch.Tensor.to = spyre_to
+    # Dynamo cannot trace INTO the Python ``spyre_to``: it inlines the wrapper,
+    # hits the C++ ``orig_to`` call, and graph-breaks — forcing the whole region
+    # to run eager, where D2D dtype casts (e.g. fp16<->bf16) are wrong. Mark
+    # ``.to`` allow_in_graph so Dynamo treats it as a leaf and traces its tensor
+    # semantics (-> prims.convert_element_type) directly, keeping the region
+    # compiled. (An ``is_compiling()`` guard inside spyre_to does NOT help — the
+    # break fires on ``orig_to`` regardless of the branch taken.)
+    #
+    # Scope note: this is a process-global registration affecting every user of
+    # ``torch.Tensor.to``, not just Spyre. That is acceptable here because
+    # torch-spyre already monkey-patches ``torch.Tensor.to`` globally (line
+    # above), so this backend already owns ``.to``'s behavior in-process;
+    # marking it allow_in_graph only changes how Dynamo traces it (as a leaf),
+    # which is harmless for cpu/other-backend tensors (spyre_to falls through to
+    # ``orig_to`` semantics for them).
+    torch._dynamo.allow_in_graph(torch.Tensor.to)
     torch.empty = spyre_empty
 
     # ── Optimal weight loading (issue #1339) ──────────────
@@ -248,12 +280,152 @@ def _patch_tensor_for_spyre():
             guard.user_stack,
         )
 
+    # ── invoke_subgraph reuse support ────────────────────────────────────
+    # Because we replace GuardBuilder.TENSOR_MATCH, guards it builds report
+    # their type (via Guard.create_fn_name(), i.e. create_fn.__name__) as
+    # "_spyre_TENSOR_MATCH" rather than "TENSOR_MATCH". torch's
+    # invoke_subgraph subgraph-reuse path (torch._dynamo.variables.
+    # invoke_subgraph) looks each guard's type up in GUARD_VALUE_DISPATCH to
+    # re-evaluate it mid-trace; an unknown type there is a hard error
+    # ("subgraph_reuse: unsupported guard type ..."). So any use of
+    # torch.compiler.nested_compile_region would abort once this patch is
+    # installed.
+    #
+    # Register a spec under our name that mirrors stock TENSOR_MATCH's
+    # metadata check AND additionally compares SpyreTensorLayout, matching
+    # what the runtime lambda guard above actually enforces — so a subgraph
+    # is only reused when both the standard tensor metadata and the device
+    # layout still match. Guarded behind availability so older torch without
+    # the reuse machinery is unaffected.
+    try:
+        from torch._dynamo.guards import (
+            GUARD_VALUE_DISPATCH,
+            GuardCheckSpec,
+            extract_tensor_metadata,
+        )
+    except ImportError:
+        # torch predates invoke_subgraph reuse — nothing to register.
+        pass
+    else:
+
+        def _spyre_tensor_reuse_metadata(guard, value):
+            # Standard tensor metadata (shape/stride/dtype/device/
+            # requires_grad), plus the device layout for Spyre tensors
+            # (None otherwise). Mirrors extract_tensor_metadata so the
+            # comparison is identical to stock TENSOR_MATCH on the metadata
+            # axis.
+            layout = None
+            if getattr(value, "device", None) is not None and (
+                value.device.type == DEVICE_NAME
+            ):
+                layout = value.device_tensor_layout()
+            return (extract_tensor_metadata(value), layout)
+
+        def _spyre_tensor_reuse_eval(value, metadata):
+            base_metadata, expected_layout = metadata
+            if not isinstance(value, torch.Tensor):
+                return False
+            if extract_tensor_metadata(value) != base_metadata:
+                return False
+            # Layout only constrains Spyre tensors; mirror the runtime
+            # lambda guard: non-Spyre value OR layout matches.
+            if value.device.type != DEVICE_NAME:
+                return expected_layout is None
+            return value.device_tensor_layout() == expected_layout
+
+        _spyre_reuse_spec = GuardCheckSpec(
+            get_metadata_fn=_spyre_tensor_reuse_metadata,
+            eval_fn=_spyre_tensor_reuse_eval,
+        )
+        # Attach for the auto-dispatch scan, and register directly under the
+        # name Guard.create_fn_name() produces for guards this builder makes.
+        # GUARD_VALUE_DISPATCH is built once (at torch import, before this
+        # patch runs), so a direct insert is required — the scan does not
+        # re-run.
+        _spyre_TENSOR_MATCH.guard_check_spec = _spyre_reuse_spec
+        GUARD_VALUE_DISPATCH["_spyre_TENSOR_MATCH"] = _spyre_reuse_spec
+
     GuardBuilder.TENSOR_MATCH = _spyre_TENSOR_MATCH
     # ───────────────────FxGraph Cache Key Extension ───────────────────
     # Extends FxGraphHashDetails to include SpyreTensorLayout in the cache key
     # preventing incorrect disk cache hits across process boundaries.
     # ──────────────────────────────────────────────────────────────────────────
     _patch_fx_graph_hash()
+    # ─────────────── invoke_subgraph subgraph decompositions ───────────────
+    # Threads the Spyre decomposition table into the re-trace of every
+    # nested_compile_region / invoke_subgraph subgraph body, so ops that must
+    # be decomposed on Spyre (notably SDPA → online-softmax) are decomposed
+    # inside the HOP body — not just in the top-level graph.
+    # ──────────────────────────────────────────────────────────────────────────
+    _patch_invoke_subgraph_decompositions()
+
+
+def _patch_invoke_subgraph_decompositions():
+    """Thread the Spyre decomp table into invoke_subgraph subgraph re-traces.
+
+    torch-spyre installs its decomposition table only on the patched top-level
+    ``compile_fx``/``compile_fx_inner`` (see ``torch_spyre/_inductor``). But
+    ``torch.compiler.nested_compile_region`` bodies (the ``invoke_subgraph``
+    HOP) are RE-TRACED separately, via
+    ``reenter_make_fx(subgraph, subgraph_decomp_table=_extract_nested_region_config(subgraph))``.
+    ``_extract_nested_region_config`` reads
+    ``gm.meta["nested_region_config"].decompositions`` which is ``None`` unless
+    the user passed an explicit ``NestedCompileRegionOptions(decompositions=...)``.
+    With ``None``, the subgraph body is re-traced with NO decomposition table —
+    so e.g. ``aten.scaled_dot_product_attention`` survives in the subgraph and
+    torch-spyre lowers it incorrectly (Blocker 6: correct when a single call is
+    inlined by Inductor, wrong once ≥2 calls keep it as a shared HOP body).
+
+    This patch wraps ``_extract_nested_region_config`` so that when it returns
+    ``None`` (the region inherits its parent's decompositions) AND we are inside
+    a Spyre ``compile_fx`` call, it returns ``get_spyre_decomp_table()`` instead.
+    An explicit user-provided table is respected unchanged, and — because the
+    gate is the ``in_spyre_compile()`` thread-local set by the patched
+    ``compile_fx`` wrapper — a nested_compile_region compiled outside a Spyre
+    compile (pure-CPU) is left alone.
+
+    Why the thread-local (not device inspection): at HOP re-trace time the
+    subgraph body is traced on fake tensors whose device is not ``spyre`` and
+    whose weights are lifted as inputs, so scanning the subgraph GraphModule's
+    tensor devices always reports "not Spyre" (B6DIAG3, device-proven). The
+    reliable signal that this re-trace belongs to a Spyre compile is that a
+    Spyre ``compile_fx`` is on the stack — which ``_wrapper`` records.
+
+    Guarded behind availability so a torch without the invoke_subgraph reenter
+    machinery is unaffected. Idempotent.
+    """
+    import sys
+
+    mod = sys.modules.get("torch._higher_order_ops.invoke_subgraph")
+    if mod is None:
+        try:
+            import torch._higher_order_ops.invoke_subgraph as mod  # noqa: F811
+        except ImportError:
+            # torch predates the invoke_subgraph reenter path — nothing to do.
+            return
+
+    original = getattr(mod, "_extract_nested_region_config", None)
+    if original is None or getattr(original, "_spyre_decomp_patched", False):
+        return
+
+    def _spyre_extract_nested_region_config(fn):
+        # Respect an explicit user-provided table; otherwise, if this HOP
+        # re-trace is happening inside a Spyre compile, thread the Spyre decomp
+        # table so ops that must be decomposed on Spyre (notably SDPA →
+        # online-softmax) are decomposed inside the region body.
+        table = original(fn)
+        if table is not None:
+            return table
+        from torch_spyre._inductor import in_spyre_compile
+
+        if not in_spyre_compile():
+            return None
+        from torch_spyre._inductor.decompositions import get_spyre_decomp_table
+
+        return get_spyre_decomp_table()
+
+    _spyre_extract_nested_region_config._spyre_decomp_patched = True
+    mod._extract_nested_region_config = _spyre_extract_nested_region_config
 
 
 def _patch_fx_graph_hash():
