@@ -253,7 +253,6 @@ register_fallback_default(
         aten.argmin.default,
         aten.where.default,
         aten.index_copy.out,
-        aten.any.all_out,
     ]
 )
 
