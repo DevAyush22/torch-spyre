@@ -24,6 +24,7 @@ test_suite_config:
             - TestExplicitConversion::test_wa_exp_add_3d_stick_aligned
             - TestExplicitConversion::test_wa_exp_sub_3d_stick_aligned
             - TestExplicitConversion::test_wa_exp_mul_4d_stick_aligned
+            - TestExplicitConversion::test_explicit_fp16_to_fp32_chained_add_mul_3d
           mode: mandatory_success
 
         - names:
@@ -39,11 +40,6 @@ test_suite_config:
         - names:
             - TestExplicitConversion::test_half_shortcut_value_correctness
             - TestExplicitConversion::test_bfloat16_shortcut_from_fp32_value_correctness
-          mode: skip
-
-        # SKIP #2252 — chained op with mixed arrangements
-        - names:
-            - TestExplicitConversion::test_explicit_fp16_to_fp32_chained_add_mul_3d
           mode: skip
 
         # SKIP #2204 — unaligned shapes: padding propagation failure in to_dtype

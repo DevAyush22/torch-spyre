@@ -83,6 +83,7 @@ class TestExplicitConversion(unittest.TestCase):
         def fn(t):
             return t.to(torch.float32).to(torch.bfloat16)
 
+        self.assertEqual(fn(x).dtype, torch.bfloat16)
         self.compare_with_cpu(fn, x, run_eager=False)
 
     def test_to_dtype_chain_fp16_fp32_bf16(self):
@@ -92,6 +93,7 @@ class TestExplicitConversion(unittest.TestCase):
         def fn(t):
             return t.to(torch.float32).to(torch.bfloat16)
 
+        self.assertEqual(fn(x).dtype, torch.bfloat16)
         self.compare_with_cpu(fn, x, run_eager=False)
 
     def test_neg_fp16_dtype_preserved_after_explicit_cast(self):
@@ -102,6 +104,7 @@ class TestExplicitConversion(unittest.TestCase):
             y = t.to(torch.float32)
             return torch.neg(y).to(torch.float16)
 
+        self.assertEqual(fn(x).dtype, torch.float16)
         self.compare_with_cpu(fn, x, run_eager=False)
 
     def test_abs_fp16_dtype_preserved(self):
@@ -123,6 +126,7 @@ class TestExplicitConversion(unittest.TestCase):
             def fn(t):
                 return t.to(torch.float32).to(torch.float16)
 
+            self.assertEqual(fn(x).dtype, torch.float16)
             self.compare_with_cpu(fn, x, run_eager=False)
         finally:
             if orig is None:
@@ -153,6 +157,7 @@ class TestExplicitConversion(unittest.TestCase):
         def fn(t):
             return t.t().to(torch.float32).to(torch.float16)
 
+        self.assertEqual(fn(x).dtype, torch.float16)
         self.compare_with_cpu(fn, x, run_eager=False)
 
     @pytest.mark.skip(
@@ -187,6 +192,7 @@ class TestExplicitConversion(unittest.TestCase):
             y = t.float()
             return y.half()
 
+        self.assertEqual(fn(x).dtype, torch.float16)
         self.compare_with_cpu(fn, x, run_eager=False)
 
     @pytest.mark.skip(
@@ -242,6 +248,7 @@ class TestExplicitConversion(unittest.TestCase):
         def fn(t):
             return t.to(torch.float32).to(torch.float16)
 
+        self.assertEqual(fn(x).dtype, torch.float16)
         self.compare_with_cpu(fn, x, run_eager=False)
 
     def test_same_dtype_cast_is_noop_in_compiled_graph(self):
@@ -322,13 +329,6 @@ class TestExplicitConversion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @pytest.mark.skip(
-        reason=(
-            "SKIP #2252 — add output arrangement differs from "
-            "c_fp32 (DL16_TO_FP32); mul rejects mismatched inputs; "
-            "https://github.com/torch-spyre/torch-spyre/issues/2252"
-        )
-    )
     def test_explicit_fp16_to_fp32_chained_add_mul_3d(self):
         """chained add→mul with all-fp16 explicit-cast, 3D aligned."""
         x = cached_randn((2, 4, 64), differentiation="expch_x")
@@ -661,14 +661,15 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    def test_true_divide_fp16_fp16_always_promotes_to_fp32(self):
-        """true_divide(fp16, fp16) must return fp32 per PyTorch semantics."""
+    def test_true_divide_fp16_fp16_stays_fp16(self):
+        """true_divide(fp16, fp16) stays fp16 — PyTorch promotes integers to float, not float→float."""
         x = cached_randn((4, 64), differentiation="tp01_x")
         y = cached_randn((4, 64), differentiation="tp01_y")
 
         def fn(a, b):
             return torch.true_divide(a, b)
 
+        self.assertEqual(fn(x, y).dtype, torch.float16)
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
     @pytest.mark.skip(
@@ -757,12 +758,6 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, y, run_eager=False)
 
-    @pytest.mark.skip(
-        reason=(
-            "SKIP #2849 — SDSC rejects dl16tofp32 fused as a reduction operand; "
-            "https://github.com/torch-spyre/torch-spyre/issues/2849"
-        )
-    )
     def test_sum_fp16_with_dtype_fp32(self):
         """torch.sum(fp16, dtype=fp32) — implicit cast fused into reduction."""
         x = cached_randn((4, 64), differentiation="spe03_sum")
@@ -772,12 +767,6 @@ class TestImplicitPromotion(unittest.TestCase):
 
         self.compare_with_cpu(fn, x, run_eager=False)
 
-    @pytest.mark.skip(
-        reason=(
-            "SKIP #2849 — SDSC rejects dl16tofp32 fused as a reduction operand; "
-            "https://github.com/torch-spyre/torch-spyre/issues/2849"
-        )
-    )
     def test_sum_bf16_dtype_fp32(self):
         """torch.sum(bf16, dtype=fp32) — same issue as fp16 variant."""
         x = cached_randn((4, 64), dtype=torch.bfloat16, differentiation="spe03bf16_sum")
@@ -909,6 +898,7 @@ class TestDataTransfer(unittest.TestCase):
         def fn(t):
             return t.to(torch.float32).to(torch.bfloat16)
 
+        self.assertEqual(fn(x).dtype, torch.bfloat16)
         self.compare_with_cpu(fn, x, run_eager=False)
 
     def test_roundtrip_cpu_fp32_spyre_fp16_cpu(self):
@@ -936,6 +926,7 @@ class TestDataTransfer(unittest.TestCase):
         def fn(t):
             return t.to(torch.float32).to(torch.bfloat16)
 
+        self.assertEqual(fn(x).dtype, torch.bfloat16)
         self.compare_with_cpu(fn, x, run_eager=False)
 
     def test_h2d_with_simultaneous_dtype_conversion(self):
@@ -1047,10 +1038,12 @@ class TestDataTransfer(unittest.TestCase):
 
     def test_h2d_fp32_to_bool_dtype_conversion(self):
         """fp32→bool H2D: PyTorch converts on CPU then transfers; no RuntimeError."""
-        fp32_cpu = torch.randn(2, 2, dtype=torch.float32)
+        fp32_cpu = torch.tensor([[1.5, 0.0], [-0.3, 0.0]], dtype=torch.float32)
         result = fp32_cpu.to("spyre", dtype=torch.bool)
         self.assertEqual(result.device.type, "spyre")
         self.assertEqual(result.dtype, torch.bool)
+        expected = fp32_cpu.to(torch.bool)
+        self.assertTrue(torch.equal(result.cpu(), expected))
 
     def test_int64_in_range_value_preserved(self):
         """int64 value 42 round-trips correctly after silent downcast to int32."""
@@ -1071,9 +1064,8 @@ class TestDataTransfer(unittest.TestCase):
         spyre_t = t.to("spyre")
         cpu_t = spyre_t.cpu()
         self.assertEqual(cpu_t.dtype, torch.int64)
-        self.assertNotEqual(
-            cpu_t[0].item(), large_val, msg="Expected truncation for 2^40"
-        )
+        # 2^40 = 256 * 2^32: lower 32 bits are 0, so int64→int32 downcast yields 0.
+        self.assertEqual(cpu_t[0].item(), 0, msg="2^40 truncated to int32 must be 0")
 
     def test_int64_warning_fires_once_per_session(self):
         """int64 downcast warning fires when downcast_warning is enabled.

@@ -819,7 +819,7 @@ class TestNegativeScalarOperations:
         )
 
     def test_chained_fp16_fp32_scalar_ops(self, execution_mode):
-        """((x + s) * s) / s scalar chain promotes fp16 tensor through fp32."""
+        """((x + s) * s) / s scalar chain: fp16 stays fp16 with Python float scalars."""
 
         def fp16_scalar_chain(x):
             y = x + 0.5
@@ -827,10 +827,11 @@ class TestNegativeScalarOperations:
             return y / 4.0
 
         x = cached_randn((4, 64))
+        assert fp16_scalar_chain(x).dtype == torch.float16
         _compare_modes(execution_mode, fp16_scalar_chain, x, atol=0.1, rtol=0.1)
 
     def test_bf16_tensor_fp32_scalar_implicit_promotion(self, execution_mode):
-        """bf16 tensor + fp32 scalar implicit promotion."""
+        """bf16 tensor + Python float scalar: bf16 stays bf16 (Python scalars don't promote)."""
 
         def bf16_fp32_add(x):
             return x + 1.0
@@ -838,12 +839,13 @@ class TestNegativeScalarOperations:
         x = torch.randn(4, 64, dtype=torch.bfloat16)
         result = _run_spyre(execution_mode, bf16_fp32_add, x)
         expected = x + 1.0
+        assert result.cpu().dtype == torch.bfloat16
         assert torch.allclose(
             result.cpu().float(), expected.float(), atol=0.1, rtol=0.1
         )
 
     def test_inplace_fp16_add_fp32_scalar_dtype_unchanged(self, execution_mode):
-        """in-place fp16 += fp32_scalar must preserve fp16 dtype."""
+        """in-place fp16 += fp32_scalar must preserve fp16 dtype and produce correct values."""
 
         def inplace_add(x):
             x += 1.0
@@ -855,3 +857,5 @@ class TestNegativeScalarOperations:
         assert result.dtype == original_dtype, (
             f"in-place add changed dtype: {original_dtype} -> {result.dtype}"
         )
+        expected = x + torch.ones_like(x)
+        assert torch.allclose(result.cpu(), expected, atol=0.1, rtol=0.1)

@@ -6,7 +6,7 @@ test_suite_config:
       tests:
         - names:
             - TestImplicitPromotion::test_implicit_add_fp16_3d_stick_aligned
-            - TestImplicitPromotion::test_true_divide_fp16_fp16_always_promotes_to_fp32
+            - TestImplicitPromotion::test_true_divide_fp16_fp16_stays_fp16
             - TestImplicitPromotion::test_wa_sum_fp16_explicit_fp32
             - TestImplicitPromotion::test_wa_sum_bf16_explicit_fp32
             - TestImplicitPromotion::test_wa_add_4d_both_fp16
@@ -17,6 +17,8 @@ test_suite_config:
             - TestImplicitPromotion::test_wa_stack_both_fp16
             - TestImplicitPromotion::test_wa_cat_both_fp16
             - TestImplicitPromotion::test_wa_add_transposed_both_fp16
+            - TestImplicitPromotion::test_sum_fp16_with_dtype_fp32
+            - TestImplicitPromotion::test_sum_bf16_dtype_fp32
           mode: mandatory_success
 
         # SKIP #2252 — anywhere-valid: mixed arrangements rejected at SDSC validation
@@ -54,11 +56,6 @@ test_suite_config:
             - TestImplicitPromotion::test_fp16_plus_0dim_fp32_tensor_implicit_promotion
           mode: skip
 
-        # SKIP #2849 — SDSC rejects dl16tofp32 fused as a reduction operand
-        - names:
-            - TestImplicitPromotion::test_sum_fp16_with_dtype_fp32
-            - TestImplicitPromotion::test_sum_bf16_dtype_fp32
-          mode: skip
 
   global:
     supported_dtypes:

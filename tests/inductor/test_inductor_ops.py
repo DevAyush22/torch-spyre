@@ -7527,7 +7527,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 f"Expected None for unsupported {src}->{dst}, got {result}"
             )
 
-    def test_dtype_op_table_error_message_uses_torch_names(self):
+    def test_dtype_op_table_keys_are_torch_dtypes(self):
         """DtypeOpTable keys use torch.dtype objects, not internal SEN names."""
         table = DtypeOpTable.get_table()
         for src, dst in table.keys():
@@ -7546,11 +7546,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             )
 
     def test_dtype_op_table_identity_pairs_symmetric(self):
-        """Identity pairs are symmetric — (A,B) identity iff (B,A) identity."""
+        """Identity pairs are symmetric — (A,B) identity iff (B,A) identity.
+
+        X→bool pairs are excluded: bool sources use get_bool_src_operator
+        (keyed on the physical DataFormats, not torch.dtype), so they are
+        intentionally absent from the regular get_operator table.
+        """
         identity_pairs = [
             (src, dst)
             for src, dst in DtypeOpTable.get_dtype_pairs()
             if DtypeOpTable.get_operator(src, dst) == IDENTITY_OP
+            and dst != torch.bool  # bool-src uses get_bool_src_operator
         ]
         for src, dst in identity_pairs:
             rev = DtypeOpTable.get_operator(dst, src)
@@ -8171,23 +8177,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return torch.prod(a, dim=dim, keepdim=keepdim)
 
         self.compare_with_cpu(fn, x, run_eager=False)
-
-
-# Skip the 5 aligned bfloat16→float32 implicit-invalid tests pending #2843.
-_SKIP_2843 = pytest.mark.skip(
-    reason=(
-        "SKIP #2843 — propagate_layouts assigns STANDARD instead of DL16_TO_FP32 "
-        "to bfloat16→float32 conversion output; validate_ops misses the arrangement "
-        "mismatch so the invalid test gets wrong values instead of the expected error; "
-        "https://github.com/torch-spyre/torch-spyre/issues/2843"
-    ),
-)
-for _shape in TO_DTYPE_OP_SHAPES_ALIGNED:
-    _tc = f"bfloat16_to_float32_{shapes2key((_shape,))}"
-    _name = f"test_round_trip_to_dtype_implicit_invalid_add_{_tc}"
-    if hasattr(TestOps, _name):
-        setattr(TestOps, _name, _SKIP_2843(getattr(TestOps, _name)))
-del _shape, _tc, _name, _SKIP_2843
 
 
 if __name__ == "__main__":

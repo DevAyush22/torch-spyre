@@ -38,6 +38,7 @@ test_suite_config:
             - TestDataTransfer::test_compiled_copy_cross_dtype_fp32_to_fp16
           mode: skip
 
+
   global:
     supported_dtypes:
       - name: float16
