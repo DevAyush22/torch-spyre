@@ -16,13 +16,14 @@ from __future__ import annotations
 
 import pytest
 import torch
+from torch_spyre.constants import DEVICE_NAME
 
-E4M3 = torch.float8_e4m3fn
-FP8_MAX = torch.finfo(E4M3).max  # 448.0
+E4M3 = getattr(torch, "float8_e4m3fn", None)
+FP8_MAX = float(torch.finfo(E4M3).max) if E4M3 is not None else 448.0
 FP16 = torch.float16
 BF16 = torch.bfloat16
 FP32 = torch.float32
-DEVICE = "spyre"
+DEVICE = DEVICE_NAME
 BACKEND = "inductor"
 
 
@@ -1625,9 +1626,6 @@ class TestFP8EagerMode:
         ref = w_cpu.float().clamp(-FP8_MAX, FP8_MAX).to(E4M3)
         torch.testing.assert_close(w_fp8.cpu().float(), ref.float(), atol=0.0, rtol=0.0)
 
-    @pytest.mark.skip(
-        reason="Issue 8: aten::_scaled_mm not registered for spyre in eager mode"
-    )
     def test_compiled_quantize_then_eager_scaled_mm(self):
         """Quantize via compiled path, _scaled_mm in eager: validates against CPU _pipeline_ref."""
         M, K, N = 16, 128, 128

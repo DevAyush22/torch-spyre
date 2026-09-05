@@ -15,13 +15,14 @@
 from __future__ import annotations
 import pytest
 import torch
+from torch_spyre.constants import DEVICE_NAME
 
-E4M3 = torch.float8_e4m3fn
+E4M3 = getattr(torch, "float8_e4m3fn", None)
 FP16 = torch.float16
 FP32 = torch.float32
 BF16 = torch.bfloat16
 FP8_MAX = 448.0
-DEVICE = "spyre"
+DEVICE = DEVICE_NAME
 BACKEND = "inductor"
 
 
@@ -477,7 +478,10 @@ class TestFP8Dequantize:
 
     def test_shape_guard_recompile(self):
         """(2,8) then (4,8): shape guard must recompile, correct output for both shapes."""
-        fn = _compile(_dequantize_fn)
+        from torch._dynamo.testing import CompileCounterWithBackend
+
+        counter = CompileCounterWithBackend(BACKEND)
+        fn = torch.compile(_dequantize_fn, backend=counter, fullgraph=True)
         scale = torch.tensor(1.0, dtype=FP16, device=DEVICE)
         x2 = _make_arange_fp8((2, 8))
         ref2 = _dequantize_ref(x2.cpu(), scale.cpu())
@@ -485,6 +489,10 @@ class TestFP8Dequantize:
         x4 = _make_arange_fp8((4, 8))
         ref4 = _dequantize_ref(x4.cpu(), scale.cpu())
         torch.testing.assert_close(fn(x4, scale).cpu(), ref4, atol=0.0, rtol=0.0)
+        assert counter.frame_count == 2, (
+            f"expected 2 specialized graphs (dynamic=False, two distinct shapes), "
+            f"got {counter.frame_count}"
+        )
 
     @pytest.mark.skip(
         reason="https://github.com/torch-spyre/torch-spyre/issues/2526: "
@@ -1340,47 +1348,4 @@ class TestRoundtripGraphBehavior:
             atol=0.0,
             rtol=0.0,
             msg="(3,8) after (2,8) without reset: shape guard must trigger recompile",
-        )
-
-
-class TestDynamicShape:
-    """Activation roundtrip with torch.compile(dynamic=True): variable M without recompilation."""
-
-    pytestmark = [
-        *activation_roundtrip_marks,
-        pytest.mark.skip(
-            reason="https://github.com/torch-spyre/torch-spyre/issues/2525: "
-            "dynamic=True compilation skipped pending further investigation"
-        ),
-    ]
-
-    def test_dynamic_m_varying(self):
-        """torch.compile(dynamic=True): same compiled fn for M=2 then M=4."""
-        scale = torch.tensor(1.0, dtype=FP16, device=DEVICE)
-        fn_c = _compile(_quant_dequant_fn, dynamic=True)
-        for M in [2, 4]:
-            x = _make_arange_fp16((M, 8))
-            ref = _roundtrip_ref(x.cpu(), scale.cpu())
-            out = fn_c(x, scale)
-            torch.testing.assert_close(
-                out.cpu(),
-                ref,
-                atol=0.0,
-                rtol=0.0,
-                msg=f"dynamic M={M}: roundtrip differs from CPU ref",
-            )
-
-    def test_dynamic_non_uniform_input(self):
-        """torch.compile(dynamic=True) with fully non-uniform per-element values."""
-        scale = torch.tensor(1.0, dtype=FP16, device=DEVICE)
-        x = _make_arange_fp16((4, 8))
-        ref = _roundtrip_ref(x.cpu(), scale.cpu())
-        fn = _compile(_quant_dequant_fn, dynamic=True)
-        out = fn(x, scale).cpu()
-        torch.testing.assert_close(
-            out,
-            ref,
-            atol=0.0,
-            rtol=0.0,
-            msg="dynamic=True non-uniform: output does not match CPU ref",
         )
