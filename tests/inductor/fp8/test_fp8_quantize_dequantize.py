@@ -769,8 +769,8 @@ class TestRoundtripShapes:
         )
 
     @pytest.mark.skip(
-        reason="spyre_fill_tensor (C extension) raises RuntimeError for numel()==0; "
-        "spyre__zero_ in eager.py needs a numel()==0 guard before calling fill_tensor "
+        reason="https://github.com/torch-spyre/torch-spyre/issues/4312: "
+        "spyre_fill_tensor raises RuntimeError for numel()==0"
     )
     def test_2d_zero_batch(self):
         """Zero-sized first dimension (0,8): must return empty tensor, not crash."""
@@ -1349,3 +1349,55 @@ class TestRoundtripGraphBehavior:
             rtol=0.0,
             msg="(3,8) after (2,8) without reset: shape guard must trigger recompile",
         )
+
+
+class TestFP8EagerMode:
+    """quantize_fp8_with_scale and quantize_weight_fp8_with_scale in eager mode (no torch.compile)."""
+
+    def setup_method(self):
+        torch._dynamo.reset()
+
+    @pytest.mark.skip(
+        reason="https://github.com/torch-spyre/torch-spyre/issues/4313: quantize ops return None in eager mode"
+    )
+    @pytest.mark.skipif(
+        not _quantize_op_available(), reason="quantize_fp8_with_scale not registered"
+    )
+    def test_quantize_fp8_with_scale_eager(self):
+        """quantize_fp8_with_scale eager: output shape, dtype, and values match CPU oracle."""
+        M, K = 16, 128
+        torch.manual_seed(50)
+        a_cpu = torch.rand(M, K, dtype=FP16)
+        a = a_cpu.to(DEVICE)
+        sa = torch.tensor(1.0, dtype=FP16, device=DEVICE)
+
+        a_fp8 = torch.ops.spyre.quantize_fp8_with_scale(a, sa)
+
+        assert a_fp8.shape == (M, K)
+        assert a_fp8.dtype == E4M3
+        assert a_fp8.device.type == DEVICE
+        ref = a_cpu.float().clamp(-FP8_MAX, FP8_MAX).to(E4M3)
+        torch.testing.assert_close(a_fp8.cpu().float(), ref.float(), atol=0.0, rtol=0.0)
+
+    @pytest.mark.skip(
+        reason="https://github.com/torch-spyre/torch-spyre/issues/4313: quantize ops return None in eager mode"
+    )
+    @pytest.mark.skipif(
+        not _weight_quantize_op_available(),
+        reason="quantize_weight_fp8_with_scale not registered",
+    )
+    def test_quantize_weight_fp8_with_scale_eager(self):
+        """quantize_weight_fp8_with_scale eager: output shape, dtype, and values match CPU oracle."""
+        K, N = 128, 128
+        torch.manual_seed(51)
+        w_cpu = torch.rand(K, N, dtype=FP16)
+        w = w_cpu.to(DEVICE)
+        sw = torch.tensor(1.0, dtype=FP16, device=DEVICE)
+
+        w_fp8 = torch.ops.spyre.quantize_weight_fp8_with_scale(w, sw)
+
+        assert w_fp8.shape == (K, N)
+        assert w_fp8.dtype == E4M3
+        assert w_fp8.device.type == DEVICE
+        ref = w_cpu.float().clamp(-FP8_MAX, FP8_MAX).to(E4M3)
+        torch.testing.assert_close(w_fp8.cpu().float(), ref.float(), atol=0.0, rtol=0.0)

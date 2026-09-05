@@ -245,7 +245,7 @@ class TestFP8Correctness:
         torch.testing.assert_close(out, ref, atol=0.1, rtol=0.05)
 
     @pytest.mark.skip(
-        reason="Issue 5: non-contiguous activation causes unsupported stick expression"
+        reason="https://github.com/torch-spyre/torch-spyre/issues/4311: non-contiguous activation causes unsupported stick expression"
     )
     def test_noncontiguous_activation(self):
         """Non-contiguous activation (strides=(1,K)): quantize_fp8_with_scale on transposed view."""
@@ -273,7 +273,7 @@ class TestFP8Correctness:
         torch.testing.assert_close(out, ref, atol=0.1, rtol=0.05)
 
     @pytest.mark.skip(
-        reason="Issue 1: non-unit dynamic scale epilogue gives wrong output"
+        reason="https://github.com/torch-spyre/torch-spyre/issues/4305: non-unit dynamic scale epilogue gives wrong output"
     )
     def test_safe_dynamic_scale(self):
         """Dynamic safe scale (amax-computed) for both sa and sw."""
@@ -542,7 +542,7 @@ class TestFP8ScaleSemantics:
         torch.testing.assert_close(out_sa1, out_sa2, atol=0.1, rtol=0.05)
 
     @pytest.mark.skip(
-        reason="Issue 1: non-unit dynamic scale epilogue gives wrong output"
+        reason="https://github.com/torch-spyre/torch-spyre/issues/4305: non-unit dynamic scale epilogue gives wrong output"
     )
     def test_dynamic_safe_scale_from_data(self):
         """Data-driven scale via _safe_dynamic_scale (maps max→0.5, no FP16 overflow)."""
@@ -567,7 +567,7 @@ class TestFP8ScaleSemantics:
         torch.testing.assert_close(out, ref, atol=0.1, rtol=0.05)
 
     @pytest.mark.skip(
-        reason="Issue 1: non-unit dynamic scale epilogue gives wrong output"
+        reason="https://github.com/torch-spyre/torch-spyre/issues/4305: non-unit dynamic scale epilogue gives wrong output"
     )
     def test_asymmetric_dynamic_scales(self):
         """Asymmetric dynamic scales: sa >> sw (3× vs 0.1× inputs), applied independently."""
@@ -593,7 +593,7 @@ class TestFP8ScaleSemantics:
         torch.testing.assert_close(out, ref, atol=0.1, rtol=0.05)
 
     @pytest.mark.skip(
-        reason="Issue 1: test expects scale-drop overflow but scale is now applied"
+        reason="https://github.com/torch-spyre/torch-spyre/issues/4305: test expects scale-drop overflow but scale is now applied"
     )
     def test_amax_scale_fp16_pipeline(self):
         """Amax-scale with K=128: K × 448² > FP16 max → NaN/Inf expected (documents overflow)."""
@@ -612,7 +612,7 @@ class TestFP8ScaleSemantics:
 
         assert out.shape == (M, N)
         assert out.dtype == FP16
-        # When Issue 1 (scale epilogue dropped) is fixed, re-evaluate: the
+        # When https://github.com/torch-spyre/torch-spyre/issues/4305 is fixed, re-evaluate: the
         # sa×sw factor will reduce output magnitude and overflow may disappear.
         assert out.isnan().any() or out.isinf().any(), (
             "Expected FP16 overflow with amax scale — K × 448² > FP16 max (65504)"
@@ -665,7 +665,7 @@ class TestFP8AlignedShapes:
                 41,
                 "wide_n",
                 marks=pytest.mark.skip(
-                    reason="Issue 3: large N=1024 causes dxp_standalone SIGABRT"
+                    reason="https://github.com/torch-spyre/torch-spyre/issues/4309: large N=1024 causes dxp_standalone SIGABRT"
                 ),
             ),
             pytest.param(
@@ -677,7 +677,7 @@ class TestFP8AlignedShapes:
                 42,
                 "k256",
                 marks=pytest.mark.skip(
-                    reason="Issue 3: M=32 with K=256 causes dxp_standalone SIGABRT"
+                    reason="https://github.com/torch-spyre/torch-spyre/issues/4309: M=32 with K=256 causes dxp_standalone SIGABRT"
                 ),
             ),
             (4, 128, 128, 1.0, 1.0, 43, "small_m4"),
@@ -728,7 +728,7 @@ class TestFP8UnalignedShapes:
         torch._dynamo.reset()
 
     @pytest.mark.skip(
-        reason="Issue 2: K%128!=0 causes dxp_standalone SIGABRT; K=64 scheduler fails"
+        reason="https://github.com/torch-spyre/torch-spyre/issues/4308: K%128!=0 causes dxp_standalone SIGABRT; K=64 scheduler fails"
     )
     def test_k64_hardcoded_scale(self):
         """K=64 (K%128=64), sa=sw=1.0: padding to K=128, value correctness vs oracle."""
@@ -748,7 +748,7 @@ class TestFP8UnalignedShapes:
         torch.testing.assert_close(out, ref, atol=0.1, rtol=0.05)
 
     @pytest.mark.skip(
-        reason="Issue 2: K%128!=0 causes dxp_standalone SIGABRT; K=16 scheduler fails"
+        reason="https://github.com/torch-spyre/torch-spyre/issues/4308: K%128!=0 causes dxp_standalone SIGABRT; K=16 scheduler fails"
     )
     def test_k16_hardcoded_scale(self):
         """K=16 (K%128=16), sa=sw=1.0: padding to K=128, value correctness vs oracle."""
@@ -767,7 +767,9 @@ class TestFP8UnalignedShapes:
         assert not out.isinf().any()
         torch.testing.assert_close(out, ref, atol=0.1, rtol=0.05)
 
-    @pytest.mark.skip(reason="Issue 2: K%128!=0; K=2880 causes dxp_standalone SIGABRT")
+    @pytest.mark.skip(
+        reason="https://github.com/torch-spyre/torch-spyre/issues/4308: K%128!=0; K=2880 causes dxp_standalone SIGABRT"
+    )
     def test_k2880_medium_unaligned(self):
         """K=2880 (K%128=64), sa=sw=1.0: padded 2880→2944, value correctness vs oracle."""
         M, K, N = 16, 2880, 2880
@@ -787,7 +789,7 @@ class TestFP8UnalignedShapes:
 
     @pytest.mark.slow
     @pytest.mark.skip(
-        reason="Issue 2: K%128!=0 causes dxp_standalone SIGABRT; K=4032 scheduler fails"
+        reason="https://github.com/torch-spyre/torch-spyre/issues/4308: K%128!=0 causes dxp_standalone SIGABRT; K=4032 scheduler fails"
     )
     def test_k4032_large_padding(self):
         """@slow — K=4032 (K%128=64), padded 4032→4096, value correctness at production K."""
@@ -808,7 +810,7 @@ class TestFP8UnalignedShapes:
 
     @pytest.mark.slow
     @pytest.mark.skip(
-        reason="Issue 2: K%128!=0 causes dxp_standalone SIGABRT; K=3904 scheduler fails"
+        reason="https://github.com/torch-spyre/torch-spyre/issues/4308: K%128!=0 causes dxp_standalone SIGABRT; K=3904 scheduler fails"
     )
     def test_k3904_large_padding(self):
         """@slow — K=3904 (K%128=64), padded 3904→3968, value correctness at production K."""
@@ -847,7 +849,7 @@ class TestFP8LargeShapes:
             pytest.param(
                 32,
                 marks=pytest.mark.skip(
-                    reason="Issue 3: M=32 causes dxp_standalone SIGABRT at K=N=4096"
+                    reason="https://github.com/torch-spyre/torch-spyre/issues/4309: M=32 causes dxp_standalone SIGABRT at K=N=4096"
                 ),
             ),
         ],
@@ -873,7 +875,9 @@ class TestFP8LargeShapes:
             out, ref, atol=1.0, rtol=0.05, msg=f"oracle mismatch at M={M}"
         )
 
-    @pytest.mark.skip(reason="Issue 3: N=16384 causes dxp_standalone SIGABRT")
+    @pytest.mark.skip(
+        reason="https://github.com/torch-spyre/torch-spyre/issues/4309: N=16384 causes dxp_standalone SIGABRT"
+    )
     def test_wide_n_k4096_n16384(self):
         """@slow — (1,4096)@(4096,16384): Llama-style up_proj, large output width."""
         M, K, N = 1, 4096, 16384
@@ -892,7 +896,9 @@ class TestFP8LargeShapes:
         assert not out.isinf().any()
         torch.testing.assert_close(out, ref, atol=1.0, rtol=0.05)
 
-    @pytest.mark.skip(reason="Issue 3: large M=2048 causes dxp_standalone SIGABRT")
+    @pytest.mark.skip(
+        reason="https://github.com/torch-spyre/torch-spyre/issues/4309: large M=2048 causes dxp_standalone SIGABRT"
+    )
     def test_large_m_k2048_n4096(self):
         """@slow — M=2048, K=2048, N=4096: large batch at medium K (K-aligned)."""
         M, K, N = 2048, 2048, 4096
@@ -912,7 +918,7 @@ class TestFP8LargeShapes:
         torch.testing.assert_close(out, ref, atol=1.0, rtol=0.05)
 
     @pytest.mark.skip(
-        reason="Issue 3: large M=2048 and N=65536 causes dxp_standalone SIGABRT"
+        reason="https://github.com/torch-spyre/torch-spyre/issues/4309: large M=2048 and N=65536 causes dxp_standalone SIGABRT"
     )
     def test_m2048_k2048_n65536(self):
         """@slow — (2048,2048)@(2048,65536): mirrors test_large_matmul 2d shape, wide N."""
@@ -933,7 +939,7 @@ class TestFP8LargeShapes:
         torch.testing.assert_close(out, ref, atol=1.0, rtol=0.05)
 
     @pytest.mark.skip(
-        reason="Issue 5: non-contiguous activation causes unsupported stick expression"
+        reason="https://github.com/torch-spyre/torch-spyre/issues/4311: non-contiguous activation causes unsupported stick expression"
     )
     def test_noncontiguous_activation_k4096(self):
         """@slow — non-contiguous activation (strides=(1,K)) at K=4096; extends K=128 TC."""
@@ -1089,7 +1095,7 @@ class TestFP8Bias:
         torch.testing.assert_close(diff, expected_diff, atol=0.1, rtol=0.0)
 
     @pytest.mark.skip(
-        reason="Issue 1: non-unit dynamic scale epilogue gives wrong output"
+        reason="https://github.com/torch-spyre/torch-spyre/issues/4305: non-unit dynamic scale epilogue gives wrong output"
     )
     def test_dynamic_asymmetric_scale_with_bias(self):
         """Dynamic asymmetric scales (a×3, w×0.1) + bias[N]: all three epilogues active."""
@@ -1111,76 +1117,6 @@ class TestFP8Bias:
         out = fn_c(a, w, sa, sw, bias).cpu()
 
         assert out.shape == (M, N)
-        assert out.dtype == FP16
-        assert not out.isnan().any()
-        assert not out.isinf().any()
-        torch.testing.assert_close(out, ref, atol=0.1, rtol=0.05)
-
-
-class TestFP83DInput:
-    """(B,M,K) batched mm: direct 3D rejected by _check_scaled_mm_sizes; reshape workaround works."""
-
-    pytestmark = skip_no_quantize_ops
-
-    def setup_method(self):
-        torch._dynamo.reset()
-
-    @pytest.mark.skip(
-        reason="Issue 6: 3D activation rejected by ATen _check_scaled_mm_sizes at Dynamo"
-    )
-    def test_3d_activation_direct_path(self):
-        """(B,M,K)@(K,N)→(B,M,N) direct path: currently rejected by _check_scaled_mm_sizes."""
-        B, M, K, N = 2, 8, 128, 128
-        sa = _st16(1.0, DEVICE)
-        sw = _st16(1.0, DEVICE)
-        torch.manual_seed(0)
-        a_3d = torch.rand(B, M, K, dtype=FP16).to(DEVICE)
-        w = torch.rand(K, N, dtype=FP16).to(DEVICE)
-        ref = _pipeline_ref(a_3d.reshape(B * M, K), w, 1.0, 1.0, FP16).reshape(B, M, N)
-
-        def _pipeline_3d(a, w, sa, sw):
-            a_fp8 = torch.ops.spyre.quantize_fp8_with_scale(a, sa)
-            w_fp8 = torch.ops.spyre.quantize_weight_fp8_with_scale(w, sw)
-            return torch._scaled_mm(
-                a_fp8, w_fp8, scale_a=sa, scale_b=sw, out_dtype=FP16
-            )
-
-        fn_c = _compile(_pipeline_3d)
-        out = fn_c(a_3d, w, sa, sw).cpu()
-        assert out.shape == (B, M, N)
-        assert out.dtype == FP16
-        assert not out.isnan().any()
-        assert not out.isinf().any()
-        torch.testing.assert_close(out, ref, atol=0.1, rtol=0.05)
-
-    @pytest.mark.skip(
-        reason="Issue 6: 3D reshape workaround fails in propagate_layouts"
-    )
-    def test_reshape_batch_flatten_workaround(self):
-        """(B,M,K)→(B*M,K) reshape before quantize+mm; result reshaped back to (B,M,N)."""
-        B, M, K, N = 2, 8, 128, 128
-        sa_val, sw_val = 1.0, 1.0
-        sa = _st16(sa_val, DEVICE)
-        sw = _st16(sw_val, DEVICE)
-        torch.manual_seed(0)
-        a_3d = torch.rand(B, M, K, dtype=FP16).to(DEVICE)
-        w = torch.rand(K, N, dtype=FP16).to(DEVICE)
-        a_2d = a_3d.reshape(B * M, K)
-        ref = _pipeline_ref(a_2d, w, sa_val, sw_val, FP16).reshape(B, M, N)
-
-        def _pipeline_reshape_workaround(a_3d, w, sa, sw):
-            a_2d = a_3d.reshape(a_3d.shape[0] * a_3d.shape[1], a_3d.shape[2])
-            a_fp8 = torch.ops.spyre.quantize_fp8_with_scale(a_2d, sa)
-            w_fp8 = torch.ops.spyre.quantize_weight_fp8_with_scale(w, sw)
-            out_2d = torch._scaled_mm(
-                a_fp8, w_fp8, scale_a=sa, scale_b=sw, out_dtype=FP16
-            )
-            return out_2d.reshape(a_3d.shape[0], a_3d.shape[1], w.shape[1])
-
-        fn_c = _compile(_pipeline_reshape_workaround)
-        out = fn_c(a_3d, w, sa, sw).cpu()
-
-        assert out.shape == (B, M, N), f"Expected ({B},{M},{N}), got {out.shape}"
         assert out.dtype == FP16
         assert not out.isnan().any()
         assert not out.isinf().any()
@@ -1371,53 +1307,6 @@ class TestFP8OptionalParams:
 
         torch.testing.assert_close(out_default, out_fast, atol=0.0, rtol=0.0)
 
-    @pytest.mark.skip(
-        reason="Issue 7: batchmatmulfp8 accumulates in FP16 only; FP32 out_dtype unsupported"
-    )
-    def test_out_dtype_fp32(self):
-        """out_dtype=FP32: output shape, dtype, and values match FP32 CPU oracle."""
-        M, K, N = 16, 128, 128
-        sa_val, sw_val = 1.0, 1.0
-        sa = _st16(sa_val, DEVICE)
-        sw = _st16(sw_val, DEVICE)
-        a, w = _make_rand_inputs(M, K, N, device=DEVICE)
-        ref = _pipeline_ref(a, w, sa_val, sw_val, FP32)
-
-        fn_c = _compile(lambda a, w, sa, sw: _pipeline_fn(a, w, sa, sw, FP32))
-        out = fn_c(a, w, sa, sw).cpu()
-
-        assert out.shape == (M, N)
-        assert out.dtype == FP32
-        assert not out.isnan().any()
-        assert not out.isinf().any()
-        torch.testing.assert_close(out, ref, atol=0.1, rtol=0.05)
-
-    @pytest.mark.skip(
-        reason="Issue 7: batchmatmulfp8 accumulates in FP16 only; FP32 out_dtype unsupported"
-    )
-    def test_out_dtype_fp32_with_bias(self):
-        """out_dtype=FP32 + bias[N]: FP32 output with bias matches CPU oracle."""
-        M, K, N = 16, 128, 128
-        sa_val, sw_val = 1.0, 1.0
-        sa = _st16(sa_val, DEVICE)
-        sw = _st16(sw_val, DEVICE)
-        a, w = _make_rand_inputs(M, K, N, device=DEVICE)
-        torch.manual_seed(9)
-        bias = torch.rand(N, dtype=FP16) * 10 + 5
-        ref = _pipeline_ref(a, w, sa_val, sw_val, FP32, bias=bias)
-        bias = bias.to(DEVICE)
-
-        fn_c = _compile(
-            lambda a, w, sa, sw, b: _pipeline_bias_fn(a, w, sa, sw, b, FP32)
-        )
-        out = fn_c(a, w, sa, sw, bias).cpu()
-
-        assert out.shape == (M, N)
-        assert out.dtype == FP32
-        assert not out.isnan().any()
-        assert not out.isinf().any()
-        torch.testing.assert_close(out, ref, atol=0.1, rtol=0.05)
-
 
 def _col_major(t: torch.Tensor) -> torch.Tensor:
     """Return mat2 in col-major layout (stride[0]==1) — upstream PyTorch contract."""
@@ -1451,7 +1340,7 @@ class TestFP8UpstreamAPI:
         torch._dynamo.reset()
 
     @pytest.mark.skip(
-        reason="Issue 4: upstream _scaled_mm with FP8 inputs causes SIGABRT in ddl_conversion"
+        reason="https://github.com/torch-spyre/torch-spyre/issues/4310: upstream _scaled_mm with FP8 inputs causes SIGABRT in ddl_conversion"
     )
     def test_upstream_k128_unit_scale_fp16(self):
         """K=128, FP16 unit scale, uniform 0.25 FP8 inputs: exact output match."""
@@ -1475,7 +1364,7 @@ class TestFP8UpstreamAPI:
         torch.testing.assert_close(out, ref, atol=0.0, rtol=0.0)
 
     @pytest.mark.skip(
-        reason="Issue 4: upstream _scaled_mm SIGABRT; Issue 2: K=64 unaligned"
+        reason="https://github.com/torch-spyre/torch-spyre/issues/4310: upstream _scaled_mm SIGABRT; https://github.com/torch-spyre/torch-spyre/issues/4308: K=64 unaligned"
     )
     def test_upstream_k64_fp16_scale(self):
         """K=64 (K%128=64), FP16 scale: insert_bmm_padding pads 64→128, oracle correctness."""
@@ -1501,7 +1390,9 @@ class TestFP8UpstreamAPI:
         assert not out.isnan().any()
         torch.testing.assert_close(out, ref, atol=0.1, rtol=0.05)
 
-    @pytest.mark.skip(reason="Issue 4: rowwise scales trigger split_multi_ops KeyError")
+    @pytest.mark.skip(
+        reason="https://github.com/torch-spyre/torch-spyre/issues/4310: rowwise scales trigger split_multi_ops KeyError"
+    )
     def test_upstream_rowwise_scale_shape(self):
         """Per-token scales [M,1]/[1,N] (torchao/vLLM pattern): documents Spyre acceptance."""
         M, K, N = 16, 128, 128
@@ -1587,44 +1478,6 @@ class TestFP8EagerMode:
 
     def setup_method(self):
         torch._dynamo.reset()
-
-    @pytest.mark.skip(
-        reason="Issue 8: quantize ops return None in eager; requires torch.compile"
-    )
-    def test_quantize_fp8_with_scale_eager(self):
-        """quantize_fp8_with_scale eager: output shape, dtype, and values match CPU oracle."""
-        M, K = 16, 128
-        torch.manual_seed(50)
-        a_cpu = torch.rand(M, K, dtype=FP16)
-        a = a_cpu.to(DEVICE)
-        sa = _st16(1.0, DEVICE)
-
-        a_fp8 = torch.ops.spyre.quantize_fp8_with_scale(a, sa)
-
-        assert a_fp8.shape == (M, K)
-        assert a_fp8.dtype == E4M3
-        assert a_fp8.device.type == DEVICE
-        ref = a_cpu.float().clamp(-FP8_MAX, FP8_MAX).to(E4M3)
-        torch.testing.assert_close(a_fp8.cpu().float(), ref.float(), atol=0.0, rtol=0.0)
-
-    @pytest.mark.skip(
-        reason="Issue 8: quantize ops return None in eager; requires torch.compile"
-    )
-    def test_quantize_weight_fp8_with_scale_eager(self):
-        """quantize_weight_fp8_with_scale eager: output shape, dtype, and values match CPU oracle."""
-        K, N = 128, 128
-        torch.manual_seed(51)
-        w_cpu = torch.rand(K, N, dtype=FP16)
-        w = w_cpu.to(DEVICE)
-        sw = _st16(1.0, DEVICE)
-
-        w_fp8 = torch.ops.spyre.quantize_weight_fp8_with_scale(w, sw)
-
-        assert w_fp8.shape == (K, N)
-        assert w_fp8.dtype == E4M3
-        assert w_fp8.device.type == DEVICE
-        ref = w_cpu.float().clamp(-FP8_MAX, FP8_MAX).to(E4M3)
-        torch.testing.assert_close(w_fp8.cpu().float(), ref.float(), atol=0.0, rtol=0.0)
 
     def test_compiled_quantize_then_eager_scaled_mm(self):
         """Quantize via compiled path, _scaled_mm in eager: validates against CPU _pipeline_ref."""
