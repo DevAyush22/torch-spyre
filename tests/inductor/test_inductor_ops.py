@@ -2580,13 +2580,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "2d": (cached_randn((256, 128), dtype=torch.float16),),
                 "3d": (cached_randn((8, 16, 256), dtype=torch.float16),),
             },
-            # PT 2.12: the 3D fp16 (8, 16, 256) shape drifts a single element
-            # (~0.34 abs, 1/32768 elems) past tolerance under exp → sin (CPU
-            # fallback) → exp. 1D/2D pass. This is a PT 2.12 CPU-reference
-            # numerics change (the baseline the test compares against), not a
-            # Spyre kernel regression — one of the pre-existing edge cases
-            # documented and xfailed in commit 3a2d482.
-            "expect_fail": ["3d"],
+            # The 3D fp16 (8, 16, 256) shape used to drift a single element
+            # (~0.34 abs, 1/32768 elems) past tolerance and was xfailed in
+            # commit 3a2d482 as a PT 2.12 CPU-reference numerics change. That
+            # drift came from the ``sin`` in the chain; the fallback vehicle is
+            # ``cumsum`` now (``sin`` has a Spyre decomposition and no longer
+            # falls back), and all three shapes pass, so the entry is gone.
         },
         (
             "test_arange",
@@ -5884,6 +5883,23 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": SCALED_MM_TESTS,
         },
         (
+            "test_fp8_scaled_mm_granite_fp8_shapes",
+            "test_fp8_scaled_mm_granite_fp8_shapes_cpu",
+        ): {
+            "param_sets": {
+                "decode_m1_n4096_baseline": (1, 4096, 4096),
+                "decode_m2_n4096_baseline": (2, 4096, 4096),
+                "fused_qkv_n6144": (1, 4096, 6144),
+                "fused_gate_up_n25600": (1, 4096, 25600),
+                "wide_m4_n4096": (4, 4096, 4096),
+                "wide_m8_n4096": (8, 4096, 4096),
+                "prefill_warmup_m16_n4096": (16, 4096, 4096),
+                "bench_prefill_m64_n4096": (64, 4096, 4096),
+                "m8_n1024": (8, 4096, 1024),
+                "m8_n12800": (8, 4096, 12800),
+            },
+        },
+        (
             "test_multiops_split",
             "test_view_permute_mul",
         ): {
@@ -6176,6 +6192,29 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 f"{mode_name}: max abs diff: "
                 f"{(result.float() - expected).abs().max().item()}"
             )
+
+    def test_storage_offset_placeholder_view_then_contiguous(self):
+        """A view created in-graph inherits its input's storage offset."""
+        B, H, L, D = 1, 8, 64, 64
+        base = cached_randn(
+            (B, L, 3 * H * D), differentiation="ph_offset_view_contiguous"
+        )
+
+        def packed_k(x):
+            return x.chunk(3, dim=-1)[1].reshape(B, L, H, D).transpose(1, 2)
+
+        def fn(x):
+            return x.transpose(-1, -2).contiguous()
+
+        cpu_view = packed_k(base.clone())
+        expected = fn(cpu_view).float()
+        dev_view = packed_k(base.clone().to("spyre"))
+        assert dev_view.storage_offset() == H * D
+
+        result = _compile_and_run(fn, [dev_view], "spyre", compile=True)
+        assert torch.allclose(result.float(), expected, atol=0.1, rtol=0.1), (
+            f"max abs diff: {(result.float() - expected).abs().max().item()}"
+        )
 
     def test_storage_offset_placeholder_compiled_only(self, op, slicer, base):
         # Same as test_storage_offset_placeholder, minus the eager arm: eager
@@ -7314,8 +7353,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_fallback_cpu(self, x):
         def fn(t):
             t = torch.exp(t)  # compiled op
-            t = torch.sin(t)  # fallback op
-            t = torch.exp(t)  # compiled op
+            t = torch.cumsum(t.clamp(-1, 1), dim=-1)  # fallback op (aten.cumsum)
+            t = torch.exp(t.clamp(-1, 1))  # compiled op (clamp keeps exp safe)
             return t
 
         with pytest.warns(UserWarning) as record:
@@ -8740,6 +8779,54 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         compare_with_pytorch(
             spyre_fn, pytorch_fn, a, b, scale_a, scale_b, bias, atol=0.1, rtol=0.1
+        )
+
+    def test_fp8_scaled_mm_granite_fp8_shapes_cpu(self, m, k, n):
+        """Regression test for SuperDSC aborts on FP8 _scaled_mm at Granite 8B shapes.
+
+        Covers fused QKV (N=6144), fused gate_up (N=25600), and wide-M prefill
+        shapes that previously caused compilation failures (issue #4179).
+
+        Two independent fixes are exercised here:
+          Fix 1 (compute_ops.py): corrects the out/N-dim elemArr constants
+            emitted by gen_coord_info_value for the QFP8WT KERNEL weight.
+          Fix 2 (work_division.py): routes batchmatmulfp8 through the analytic
+            cost model (_cost_model_divide_op), which was previously skipped for
+            FP8 BMM ops. The cost model now produces a correct split for all N.
+        """
+        x = cached_randn(
+            (m, k), dtype=torch.float16, differentiation=("x", m, k, n), scale=0.5
+        )
+        w = cached_randn(
+            (k, n), dtype=torch.float16, differentiation=("w", m, k, n), scale=0.5
+        )
+        scale_a = torch.tensor([0.1], dtype=torch.float16)
+        scale_b = torch.tensor([0.1], dtype=torch.float16)
+
+        def spyre_fn(x, w, scale_a, scale_b):
+            xa = torch.ops.spyre.quantize_fp8_with_scale(x, scale_a)
+            wb = torch.ops.spyre.quantize_weight_fp8_with_scale(w, scale_b)
+            return torch.ops.aten._scaled_mm(
+                xa, wb, scale_a=scale_a, scale_b=scale_b, out_dtype=torch.float16
+            )
+
+        def pytorch_fn(x, w, scale_a, scale_b):
+            xa = (
+                (x / scale_a)
+                .clamp(-448.0, 448.0)
+                .to(torch.float8_e4m3fn)
+                .to(torch.float16)
+            )
+            wb = (
+                (w / scale_b)
+                .clamp(-448.0, 448.0)
+                .to(torch.float8_e4m3fn)
+                .to(torch.float16)
+            )
+            return (xa @ wb) * (scale_a * scale_b)
+
+        compare_with_pytorch(
+            spyre_fn, pytorch_fn, x, w, scale_a, scale_b, atol=2.0, rtol=0.2
         )
 
     def test_is_nonzero_cpu(self, *args):

@@ -1052,6 +1052,9 @@ class SpyreKernel(Kernel[CSEVariable]):
             tiled_symbol_trip_counts=tiled_symbol_trip_counts,
             symbolic_dim_bounds=symbolic_dim_bounds,
             node_output_ranges=node_output_ranges,
+            completed_producer_cores=(
+                relayout_plans[0].completed_producer_cores if relayout_plans else ()
+            ),
             debug_handle=debug_handle,
         )
         # Finish the operation here, while its inputs and its node are live.
@@ -1439,11 +1442,13 @@ class SpyreKernel(Kernel[CSEVariable]):
                 "positional address binding."
             )
         if emit_pool_tensor:
+            device = V.graph.get_current_device_or_throw()
             wrapper.writeline(
                 f"{pool_var_name} = spyre_empty_with_layout("
                 f"({self.pool_size},), (1,), torch.uint8, "
                 f"SpyreTensorLayout(device_size=[{self.pool_size}], "
-                f"stride_map=[1], device_dtype=DataFormats.SENINT8))"
+                f"stride_map=[1], device_dtype=DataFormats.SENINT8), "
+                f"device=torch.device('{device}'))"
             )
             call_args.append(pool_var_name)
 
@@ -1616,6 +1621,10 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                             sympy_str(r) + ", " for r in op_spec.node_output_ranges
                         )
                         + "),"
+                    )
+                if op_spec.completed_producer_cores:
+                    buf.writeline(
+                        f"completed_producer_cores={op_spec.completed_producer_cores!r},"
                     )
                 if op_spec.debug_handle is not None:
                     # Source-to-kernel provenance must survive the OpSpec ->
