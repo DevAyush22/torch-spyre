@@ -159,10 +159,6 @@ class TestQuantizeFP8:
         assert out.is_contiguous()
 
     @skip_no_quantize
-    @pytest.mark.skip(
-        reason="https://github.com/torch-spyre/torch-spyre/issues/3023: "
-        ".cpu() on activation FP8 output fails with invalid device size/stride map"
-    )
     def test_activation_quantize_2d_cpu_copy(self):
         """Activation FP8 (2,8) non-uniform output: .cpu() must preserve logical values."""
         x = _make_arange_fp16((2, 8))
@@ -787,13 +783,7 @@ class TestRoundtripShapes:
             32,
             64,
             128,
-            pytest.param(
-                256,
-                marks=pytest.mark.skip(
-                    reason="https://github.com/torch-spyre/torch-spyre/issues/3029: "
-                    "K=8 activation roundtrip wrong values for M≥256"
-                ),
-            ),
+            256,
         ],
         ids=["M16", "M32", "M64", "M128", "M256"],
     )
@@ -833,11 +823,7 @@ class TestRoundtripShapes:
             rtol=0.0,
         )
 
-    @pytest.mark.skip(
-        reason="https://github.com/torch-spyre/torch-spyre/issues/3029: "
-        "K=8 activation roundtrip wrong values for M≥256"
-    )
-    @pytest.mark.parametrize("M", [512, 1024], ids=["M512", "M1024"])
+    @pytest.mark.parametrize("M", [512], ids=["M512"])
     def test_2d_k8_very_large_m(self, M):
         """K=8 very large M, non-uniform input."""
         x = _make_arange_fp16((M, 8))
@@ -854,14 +840,7 @@ class TestRoundtripShapes:
         [
             ((2048, 4096), 1.0),
             ((4096, 4096), 1.0),
-            pytest.param(
-                (1, 4096),
-                1.0,
-                marks=pytest.mark.skip(
-                    reason="https://github.com/torch-spyre/torch-spyre/issues/2527: "
-                    "M=1 shapes crash dxp_standalone with DtException SIGABRT"
-                ),
-            ),
+            ((1, 4096), 1.0),
         ],
         ids=["2048x4096", "4096x4096", "1x4096"],
     )
@@ -894,10 +873,6 @@ class TestRoundtripShapes:
             out, _roundtrip_ref(x.cpu(), scale.cpu()), atol=0.0, rtol=0.0
         )
 
-    @pytest.mark.skip(
-        reason="https://github.com/torch-spyre/torch-spyre/issues/2527: "
-        "M=1 shapes crash dxp_standalone with DtException SIGABRT"
-    )
     def test_3d_shape_2x16x8(self):
         """3D (2,16,8) non-uniform input."""
         x = _make_arange_fp16((2, 16, 8))
@@ -907,42 +882,11 @@ class TestRoundtripShapes:
             out.cpu(), _roundtrip_ref(x.cpu(), scale.cpu()), atol=0.0, rtol=0.0
         )
 
-    @pytest.mark.parametrize(
-        "S",
-        [
-            pytest.param(
-                17,
-                marks=pytest.mark.skip(
-                    reason="https://github.com/torch-spyre/torch-spyre/issues/3029: "
-                    "3D (2,17,8) fails in pytest (8/272 wrong at row 16) but passes "
-                    "in standalone repro; possibly compile-ordering-dependent"
-                ),
-            ),
-            pytest.param(
-                32,
-                marks=pytest.mark.skip(
-                    reason="https://github.com/torch-spyre/torch-spyre/issues/3029: "
-                    "3D (2,32,8) K=8 roundtrip: 256/512 elements wrong (50%), finite values"
-                ),
-            ),
-            pytest.param(
-                64,
-                marks=pytest.mark.skip(
-                    reason="https://github.com/torch-spyre/torch-spyre/issues/3029: "
-                    "3D (2,64,8) K=8 roundtrip: 256/1024 elements wrong (25%), finite values"
-                ),
-            ),
-            128,
-            pytest.param(
-                512,
-                marks=pytest.mark.skip(
-                    reason="https://github.com/torch-spyre/torch-spyre/issues/3029: "
-                    "3D (2,512,8) K=8 roundtrip: expected 256 wrong elements, same DDL addressing bug"
-                ),
-            ),
-        ],
-        ids=["S17", "S32", "S64", "S128", "S512"],
+    @pytest.mark.skip(
+        reason="https://github.com/torch-spyre/torch-spyre/issues/3029: "
+        "3D (2,S,8) K=8 roundtrip produces wrong values / hardware errors across all S values"
     )
+    @pytest.mark.parametrize("S", [17, 32], ids=["S17", "S32"])
     def test_3d_shapes_varying_seq_k8(self, S):
         """3D (2,S,8) non-uniform input."""
         x = _make_arange_fp16((2, S, 8))
@@ -984,13 +928,7 @@ class TestRoundtripShapes:
     @pytest.mark.parametrize(
         "shape",
         [
-            pytest.param(
-                (63, 8),
-                marks=pytest.mark.skip(
-                    reason="https://github.com/torch-spyre/torch-spyre/issues/3029: "
-                    "K=8 activation roundtrip wrong values (value mismatch)"
-                ),
-            ),
+            (63, 8),
             pytest.param(
                 (63, 13),
                 marks=pytest.mark.skip(

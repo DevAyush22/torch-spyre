@@ -656,30 +656,8 @@ class TestFP8AlignedShapes:
         "M,K,N,sa_val,sw_val,seed,label",
         [
             (16, 128, 128, 1.0, 1.0, 40, "base"),
-            pytest.param(
-                8,
-                128,
-                1024,
-                1.0,
-                1.0,
-                41,
-                "wide_n",
-                marks=pytest.mark.skip(
-                    reason="https://github.com/torch-spyre/torch-spyre/issues/4309: large N=1024 causes dxp_standalone SIGABRT"
-                ),
-            ),
-            pytest.param(
-                32,
-                256,
-                256,
-                1.0,
-                1.0,
-                42,
-                "k256",
-                marks=pytest.mark.skip(
-                    reason="https://github.com/torch-spyre/torch-spyre/issues/4309: M=32 with K=256 causes dxp_standalone SIGABRT"
-                ),
-            ),
+            (8, 128, 1024, 1.0, 1.0, 41, "wide_n"),
+            (32, 256, 256, 1.0, 1.0, 42, "k256"),
             (4, 128, 128, 1.0, 1.0, 43, "small_m4"),
             # Canonical K=128 shapes from test_fp8_scaled_mm_cpu param_sets:
             (128, 128, 128, 1.0, 1.0, 1, "m128"),
@@ -846,12 +824,7 @@ class TestFP8LargeShapes:
             4,
             8,
             16,
-            pytest.param(
-                32,
-                marks=pytest.mark.skip(
-                    reason="https://github.com/torch-spyre/torch-spyre/issues/4309: M=32 causes dxp_standalone SIGABRT at K=N=4096"
-                ),
-            ),
+            32,
         ],
         ids=["m1", "m2", "m4", "m8", "m16", "m32"],
     )
@@ -875,9 +848,6 @@ class TestFP8LargeShapes:
             out, ref, atol=1.0, rtol=0.05, msg=f"oracle mismatch at M={M}"
         )
 
-    @pytest.mark.skip(
-        reason="https://github.com/torch-spyre/torch-spyre/issues/4309: N=16384 causes dxp_standalone SIGABRT"
-    )
     def test_wide_n_k4096_n16384(self):
         """@slow — (1,4096)@(4096,16384): Llama-style up_proj, large output width."""
         M, K, N = 1, 4096, 16384
@@ -896,9 +866,6 @@ class TestFP8LargeShapes:
         assert not out.isinf().any()
         torch.testing.assert_close(out, ref, atol=1.0, rtol=0.05)
 
-    @pytest.mark.skip(
-        reason="https://github.com/torch-spyre/torch-spyre/issues/4309: large M=2048 causes dxp_standalone SIGABRT"
-    )
     def test_large_m_k2048_n4096(self):
         """@slow — M=2048, K=2048, N=4096: large batch at medium K (K-aligned)."""
         M, K, N = 2048, 2048, 4096
@@ -917,9 +884,6 @@ class TestFP8LargeShapes:
         assert not out.isinf().any()
         torch.testing.assert_close(out, ref, atol=1.0, rtol=0.05)
 
-    @pytest.mark.skip(
-        reason="https://github.com/torch-spyre/torch-spyre/issues/4309: large M=2048 and N=65536 causes dxp_standalone SIGABRT"
-    )
     def test_m2048_k2048_n65536(self):
         """@slow — (2048,2048)@(2048,65536): mirrors test_large_matmul 2d shape, wide N."""
         M, K, N = 2048, 2048, 65536
