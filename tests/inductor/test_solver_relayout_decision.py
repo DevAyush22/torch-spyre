@@ -17,8 +17,8 @@
 A relayout group's destination is a ``RelayoutCopyBuffer``: an ordinary buffer
 whose residency IS the decision to shuffle, placed by the same no-overlap as
 everything else and priced by a plain term of the shared sympy objective
-(``cost_term``). Handcrafted buffers drive the pieces directly - no graph, no
-compile:
+(``cost_term``, one ``RelayoutCharge`` node per copy). Handcrafted buffers
+drive the pieces directly - no graph, no compile:
 
 - the price term is solver-agnostic: evaluated by ``lambdify`` it charges the
   source's chosen division exactly when the copy is resident;
@@ -42,7 +42,9 @@ import sympy
 
 pytest.importorskip("ortools")
 
+from torch_spyre._inductor import config
 from torch_spyre._inductor.pass_utils import PerCoreView
+from torch_spyre._inductor.scratchpad import ilp_solver_ortools
 from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
 from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolver
 from torch_spyre._inductor.scratchpad.lx_relayout import (
@@ -60,6 +62,24 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
 _SPILL_NS = 20000.0  # what spilling P charges in the crafted objective
 _CORE = sympy.Symbol("core_id")
 _PER_CORE = 16  # P is 64 bytes sliced 4 ways
+
+
+@pytest.mark.parametrize(
+    "cap,costs,expected",
+    [(1, {0: 10000, 1: 1000}, [1]), (1, None, [0]), (0, {0: 10000, 1: 1000}, [0, 1])],
+)
+def test_relayout_shortlist_prices_the_consumer(monkeypatch, cap, costs, expected):
+    """Saving 500 ns on a copy must not hide a 9000 ns faster consumer."""
+    monkeypatch.setattr(config, "lx_solver_relayout_groups_per_edge", cap)
+    candidates = [
+        _candidate("C", 0, 500, group=0, j=0),
+        _candidate("C", 0, 1000, group=1, j=1),
+    ]
+    divisions = [CoreDivision(splits={sympy.Symbol("d0"): 4})] * 2
+    kept = CoOptimizingAllocator._cap_relayout_groups(
+        "P", "C", candidates, divisions, costs
+    )
+    assert [c.group for c in kept] == expected
 
 
 def _view(slot: int, num_cores: int = 4) -> PerCoreView:
@@ -147,6 +167,57 @@ def _copy(result, group=0) -> RelayoutCopyBuffer:
 
 def _disjoint(a_addr, b_addr, footprint=_PER_CORE) -> bool:
     return not (a_addr < b_addr + footprint and b_addr < a_addr + footprint)
+
+
+@pytest.mark.parametrize("priced", [False, True])
+def test_relayout_solve_presolves_by_default(monkeypatch, priced):
+    from ortools.sat.python import cp_model
+
+    p = _producer([0, 1])
+    c = _consumer("C", 1, 2, [_candidate("C", 0, 5000.0)])
+    buffers = _with_copies(p, c)
+    original = cp_model.CpSolver.Solve
+    parameters = []
+
+    def solve(solver, model, *args, **kwargs):
+        parameters.append(solver.parameters.cp_model_presolve)
+        assert solver.parameters.max_time_in_seconds == config.cpsat_time_limit_seconds
+        return original(solver, model, *args, **kwargs)
+
+    monkeypatch.setattr(cp_model.CpSolver, "Solve", solve)
+    result = _solve(buffers, expr=_objective(buffers) if priced else None)
+    assert parameters and all(parameters)
+    assert (_copy(result).address is not None) == priced
+
+
+@pytest.mark.parametrize("deterministic,expected_workers", [(False, 96), (True, 1)])
+def test_relayout_solve_uses_available_parallel_search_workers(
+    monkeypatch, deterministic, expected_workers
+):
+    """Only deterministic mode restricts CP-SAT's parallel search portfolio."""
+    from ortools.sat.python import cp_model
+
+    p = _producer([0, 1])
+    c = _consumer("C", 1, 2, [_candidate("C", 0, 5000.0)])
+    buffers = _with_copies(p, c)
+    original = cp_model.CpSolver.Solve
+    workers = []
+
+    monkeypatch.setattr(ilp_solver_ortools, "get_cpu_count", lambda: 96)
+    monkeypatch.setattr(
+        ilp_solver_ortools.torch,
+        "are_deterministic_algorithms_enabled",
+        lambda: deterministic,
+    )
+
+    def solve(solver, model, *args, **kwargs):
+        workers.append(solver.parameters.num_search_workers)
+        assert not solver.parameters.share_level_zero_bounds
+        return original(solver, model, *args, **kwargs)
+
+    monkeypatch.setattr(cp_model.CpSolver, "Solve", solve)
+    _solve(buffers, expr=_objective(buffers))
+    assert workers == [expected_workers]
 
 
 # ---------------------------------------------------------------------------
@@ -482,7 +553,7 @@ def test_copy_spans_a_consumer_outside_the_group():
 def test_charge_follows_the_chosen_source_division():
     """P offers two divisions whose shuffles into the same destination view
     price differently (5000 vs 3000 ns). The solver picks the cheaper source
-    division, and the KroneckerDelta term charges that price: with the
+    division, and the RelayoutCharge term charges that price: with the
     spill at 4000 only the cheaper division makes the relayout worth it."""
     bufs = _with_copies(
         _producer([0, 3], divisions=2),
