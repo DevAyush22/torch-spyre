@@ -552,7 +552,7 @@ TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
         cached_randn(shape, dtype=src),
         dst,
     )
-    for src in [torch.float16, torch.float32]
+    for src in [torch.float16, torch.bfloat16, torch.float32]
     for dst in [torch.float16, torch.float32]
     if src != dst
     for shape in TO_DTYPE_OP_SHAPES
@@ -560,7 +560,7 @@ TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
 
 TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL = [
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}"
-    for src in [torch.float16, torch.float32]
+    for src in [torch.float16, torch.bfloat16, torch.float32]
     for dst in [torch.float16, torch.float32]
     if src != dst
     for shape in TO_DTYPE_OP_SHAPES_UNALIGNED
@@ -1500,6 +1500,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         (67, 256), dim=1, min_val=0, max_val=100, dtype=torch.int64
                     ),
                 ),
+            },
+        },
+        ("test_topk_fused_softmax", "test_topk_fused_softmax_router"): {
+            "param_sets": {
+                # Stick-aligned (64 fp16 per 128-byte stick) and unaligned.
+                "w64": (64,),
+                "w96": (96,),
+                "w128": (128,),
+                "w160": (160,),
+                "w192": (192,),
             },
         },
         ("test_topk", "test_topk_cpu"): {
@@ -6033,6 +6043,70 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d_to_4d_view_permute_mul": (cached_randn((2, 3, 4)),),
             },
         },
+        # A view that splits the stick dim into (heads, D) and then slices or
+        # strides D makes the read walk the stick-tile dim in steps (``2*d1``).
+        # That stride used to inflate the dim's footprint and double every
+        # outer stride, so output row l read input row 2*l (issue #4050).
+        ("test_view_split_stick_slice", "test_view_split_stick_slice_cpu"): {
+            "param_sets": {
+                "head_half_lo": (
+                    (1, 8, 4, 128),
+                    lambda t: t[..., :64],
+                    cached_randn((1, 8, 512), differentiation="vss_lo"),
+                ),
+                "head_half_hi_offset": (
+                    (1, 8, 4, 128),
+                    lambda t: t[..., 64:],
+                    cached_randn((1, 8, 512), differentiation="vss_hi"),
+                ),
+                "head_sub_stick": (
+                    (1, 8, 4, 128),
+                    lambda t: t[..., :32],
+                    cached_randn((1, 8, 512), differentiation="vss_sub"),
+                ),
+                "transposed_head_half_lo": (
+                    (1, 8, 4, 128),
+                    lambda t: t.transpose(1, 2)[..., :64],
+                    cached_randn((1, 8, 512), differentiation="vss_tlo"),
+                ),
+                "transposed_head_half_hi_offset": (
+                    (1, 8, 4, 128),
+                    lambda t: t.transpose(1, 2)[..., 64:],
+                    cached_randn((1, 8, 512), differentiation="vss_thi"),
+                ),
+                "batched_head_half_lo": (
+                    (4, 8, 4, 128),
+                    lambda t: t[..., :64],
+                    cached_randn((4, 8, 512), differentiation="vss_b4"),
+                ),
+                "quarter_of_4_stick_head": (
+                    (1, 8, 4, 256),
+                    lambda t: t[..., :64],
+                    cached_randn((1, 8, 1024), differentiation="vss_q"),
+                ),
+                "step2_over_sticks": (
+                    (1, 8, 8, 64),
+                    lambda t: t[:, :, ::2, :],
+                    cached_randn((1, 8, 512), differentiation="vss_s2"),
+                ),
+                "step2_over_sticks_offset": (
+                    (1, 8, 8, 64),
+                    lambda t: t[:, :, 1::2, :],
+                    cached_randn((1, 8, 512), differentiation="vss_s2o"),
+                ),
+            },
+        },
+        # rotate_half on q/k built by view + transpose of the projection output:
+        # the HF attention pattern issue #4050 was reported against.
+        ("test_rope_on_split_stick_view", "test_rope_on_split_stick_view_cpu"): {
+            "param_sets": {
+                "b1_l8_h4_d128": (
+                    cached_randn((1, 8, 512), differentiation="rope_h"),
+                    cached_randn((1, 8, 128), differentiation="rope_cos"),
+                    cached_randn((1, 8, 128), differentiation="rope_sin"),
+                ),
+            },
+        },
         ("test_transpose_patterns", "test_transpose_patterns_cpu"): {
             "param_sets": _pattern_param_sets(),
         },
@@ -6445,6 +6519,99 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 f"{mode_name}: max abs diff: "
                 f"{(result.float() - expected).abs().max().item()}"
             )
+
+    def test_storage_offset_placeholder_lo4_fresh_trace_pointwise(self):
+        def fn(x):
+            return x + x
+
+        base = cached_randn((8, 128), differentiation="ph_lo4_pointwise")
+        cpu_view = base.clone()[4:6, :]
+        expected = fn(cpu_view).float()
+
+        dev_view = base.clone().to("spyre")[4:6, :]
+        result = _compile_and_run(fn, [dev_view], "spyre", compile=True)
+        assert torch.allclose(result.float(), expected, atol=0.1, rtol=0.1), (
+            f"max abs diff: {(result.float() - expected).abs().max().item()} -- "
+            "fresh-trace offset-4 layout computation itself is broken (see #3770)"
+        )
+
+    def test_storage_offset_placeholder_lo4_fresh_trace_bmm(self):
+        def fn(w_chunk, x):
+            # [Ec, H, F] x [Ec, F, N] -> [Ec, H, N], one matmul per expert
+            # in the chunk -- shaped like the chunked expert FFN.
+            return torch.bmm(w_chunk, x)
+
+        E, H, F, N = 8, 32, 64, 32
+        Ec = 2
+        lo = 4
+        base_w = cached_randn((E, H, F), differentiation="ph_moe_expert_w_lo4")
+        x = cached_randn((Ec, F, N), differentiation="ph_moe_expert_x_lo4").to("spyre")
+        cpu_w_chunk = base_w.clone()[lo : lo + Ec]
+        expected = fn(cpu_w_chunk, x.cpu()).float()
+
+        dev_w_chunk = base_w.clone().to("spyre")[lo : lo + Ec]
+        result = _compile_and_run(fn, [dev_w_chunk, x], "spyre", compile=True)
+        mean_rel = (
+            (result.float() - expected).abs().mean()
+            / expected.abs().mean().clamp(min=1e-6)
+        ).item()
+        assert torch.allclose(result.float(), expected, atol=0.1, rtol=0.1), (
+            f"mean_rel={mean_rel:.4f}, max abs diff: "
+            f"{(result.float() - expected).abs().max().item()} -- single "
+            "fresh-trace bmm on an outer/batch-dim offset chunk is wrong "
+            "with NO reuse involved (see #3770)"
+        )
+
+    def test_storage_offset_placeholder_reused_graph_distinct_offsets(self):
+        def fn(x):
+            return x + x
+
+        base = cached_randn((8, 128), differentiation="ph_reuse_graph_offsets")
+        dev_base = base.clone().to("spyre")
+        comp = torch.compile(fn, dynamic=False)
+
+        for lo in (0, 4, 1, 6):
+            with self.subTest(lo=lo):
+                dev_view = dev_base[lo : lo + 1, :]
+                cpu_view = base.clone()[lo : lo + 1, :]
+                expected = fn(cpu_view).float()
+                result = comp(dev_view).cpu()
+                assert torch.allclose(result.float(), expected, atol=0.1, rtol=0.1), (
+                    f"lo={lo}: max abs diff: "
+                    f"{(result.float() - expected).abs().max().item()} -- "
+                    "compiled graph likely reused a stale storage_offset=0 "
+                    "trace (see #3770)"
+                )
+
+    def test_storage_offset_placeholder_moe_expert_chunk_matmul(self):
+        def fn(w_chunk, x):
+            # [Ec, H, F] x [Ec, F, N] -> [Ec, H, N], one matmul per expert
+            # in the chunk -- shaped like the chunked expert FFN.
+            return torch.bmm(w_chunk, x)
+
+        E, H, F, N = 8, 32, 64, 32
+        Ec = 2
+        base_w = cached_randn((E, H, F), differentiation="ph_moe_expert_w")
+        x = cached_randn((Ec, F, N), differentiation="ph_moe_expert_x").to("spyre")
+        dev_base_w = base_w.clone().to("spyre")
+        comp = torch.compile(fn, dynamic=False)
+
+        for lo in (0, 4):
+            with self.subTest(lo=lo):
+                w_chunk = dev_base_w[lo : lo + Ec]
+                cpu_w_chunk = base_w.clone()[lo : lo + Ec]
+                expected = fn(cpu_w_chunk, x.cpu()).float()
+                result = comp(w_chunk, x).cpu()
+                mean_rel = (
+                    (result.float() - expected).abs().mean()
+                    / expected.abs().mean().clamp(min=1e-6)
+                ).item()
+                assert torch.allclose(result.float(), expected, atol=0.1, rtol=0.1), (
+                    f"lo={lo}: mean_rel={mean_rel:.4f}, max abs diff: "
+                    f"{(result.float() - expected).abs().max().item()} -- "
+                    "expert chunk at nonzero storage_offset read the wrong "
+                    "storage (see #3770)"
+                )
 
     def test_storage_offset_placeholder_fixed_layout_rejected(self):
         # Fixed-layout ops need their inputs' sticks where the op dictates, so
@@ -6886,6 +7053,31 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 [x],
                 "spyre",
             )
+
+    @unittest.skip("topk.ddl does not support sparse input tensors; see #4732")
+    def test_topk_sparse_input(self):
+        # amax over the stick dim produces a sparse output (constant 0 in the
+        # rightmost device coord). topk over a surviving dim of that sparse
+        # tensor must accept the zero-stick layout without forcing a restickify.
+        # Skipped: backend (dxp_standalone / topk.ddl) does not yet support sparse
+        # input tensors to topk ("None of the dimensions is mapped"); see #4732.
+        x = unique_randn_along_dim((32, 32, 64), dim=-1)
+        self.compare_with_cpu(
+            lambda x: torch.topk(torch.amax(x, dim=-1), 4, dim=-1)[0],
+            x,
+            run_eager=False,
+        )
+
+    def test_topk_fused_softmax_router(self, width: int):
+        # Fused softmax->topk: the producer's layout reaches topk through the
+        # restickify graph, so the reduction dim must be pushed off the stick
+        # instead of inherited. Stick-aligned and unaligned widths both covered.
+        x = unique_randn_along_dim((64, width), dim=-1)
+        self.compare_with_cpu(
+            lambda x: torch.topk(torch.softmax(x, dim=-1), 4, dim=-1)[0],
+            x,
+            run_eager=False,
+        )
 
     def test_keep_by_index_cpu(self, x, k: int, dim: int, fill_value: float):
         _, indices = torch.topk(x, k, dim=dim, largest=True)
@@ -7690,6 +7882,37 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, x)
 
+    def test_view_split_stick_slice_cpu(self, view_shape, slicer, x):
+        """View the stick dim as (heads, D), then slice or stride D.
+
+        Compiled path only: the eager path materialises such views through
+        copy_from_d2d, which rejects sub-stick offsets for unrelated reasons.
+        """
+
+        def fn(x):
+            return slicer(x.view(*view_shape)) * 1.0
+
+        self.compare_with_cpu(fn, x, run_eager=False)
+
+    def test_rope_on_split_stick_view_cpu(self, hidden, cos, sin):
+        """rotate_half on q and k that are view + transpose of one buffer."""
+        B, L, H, D = 1, 8, 4, 128
+
+        def rotate_half(t):
+            half = t.shape[-1] // 2
+            return torch.cat((-t[..., half:], t[..., :half]), dim=-1)
+
+        def fn(hidden, cos, sin):
+            q = hidden.view(B, L, H, D).transpose(1, 2)
+            k = hidden.view(B, L, H, D).transpose(1, 2)
+            cos = cos.unsqueeze(1)
+            sin = sin.unsqueeze(1)
+            q = (q * cos) + (rotate_half(q) * sin)
+            k = (k * cos) + (rotate_half(k) * sin)
+            return q.contiguous(), k.contiguous()
+
+        self.compare_with_cpu(fn, hidden, cos, sin, run_eager=False)
+
     # --- Migrated from test_ops.py ---
 
     def test_copy_roundtrip(self, x):
@@ -7899,6 +8122,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         self.compare_with_cpu(fn, x, diagonal)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    @inductor_config.patch({"cpsat_time_limit_seconds": 30})
     def test_sdpa_cpu(self, q, k, v, attn_mask, is_causal, enable_gqa):
         def fn(q, k, v, attn_mask, is_causal, enable_gqa):
             return torch.nn.functional.scaled_dot_product_attention(
@@ -8329,6 +8553,43 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         else:
             assert result is None, (
                 f"Expected None for unsupported {src}->{dst}, got {result}"
+            )
+
+    def test_dtype_op_table_keys_are_torch_dtypes(self):
+        """DtypeOpTable keys use torch.dtype objects, not internal SEN names."""
+        table = DtypeOpTable.get_table()
+        for src, dst in table.keys():
+            assert isinstance(src, torch.dtype), (
+                f"Expected torch.dtype key, got {type(src)}: {src}"
+            )
+            assert isinstance(dst, torch.dtype), (
+                f"Expected torch.dtype key, got {type(dst)}: {dst}"
+            )
+        for src, dst in DtypeOpTable.get_dtype_pairs():
+            assert isinstance(src, torch.dtype), (
+                f"Expected torch.dtype in pairs, got {type(src)}: {src}"
+            )
+            assert isinstance(dst, torch.dtype), (
+                f"Expected torch.dtype in pairs, got {type(dst)}: {dst}"
+            )
+
+    def test_dtype_op_table_identity_pairs_symmetric(self):
+        """Identity pairs are symmetric — (A,B) identity iff (B,A) identity.
+
+        X→bool pairs are excluded: bool sources use get_bool_src_operator
+        (keyed on the physical DataFormats, not torch.dtype), so they are
+        intentionally absent from the regular get_operator table.
+        """
+        identity_pairs = [
+            (src, dst)
+            for src, dst in DtypeOpTable.get_dtype_pairs()
+            if DtypeOpTable.get_operator(src, dst) == IDENTITY_OP
+            and dst != torch.bool  # bool-src uses get_bool_src_operator
+        ]
+        for src, dst in identity_pairs:
+            rev = DtypeOpTable.get_operator(dst, src)
+            assert rev == IDENTITY_OP, (
+                f"({src},{dst}) is identity but ({dst},{src}) returned {rev}"
             )
 
     def test_to_dtype_cpu(self, x, dst_dtype):
