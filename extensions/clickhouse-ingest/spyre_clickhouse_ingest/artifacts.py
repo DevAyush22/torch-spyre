@@ -30,16 +30,20 @@ with "artifact" = {"component", "artifact_name", "id12", "arch", "kind", "ref"}.
 A release manifest is JSON:
     {"name": "<release name>", "date": "YYYY-MM-DD", "family": "<tag family of name>",
      "sources": [{"repo": "...", "ref": "v0.5.0-rc.1", "sha": "<40 hex>"}],
-     "images": [{"ref": "<registry>/<repo>:<tag>@sha256:<per-arch digest>", "arch": "s390x"}],
+     "images": [{"ref": "<registry>/<repo>:<tag>@sha256:<per-arch digest>", "arch": "s390x"},
+                {"ref": "<registry>/<repo>:<tag>@sha256:<manifest-list digest>", "arch": "multi",
+                 "manifests": {"s390x": "sha256:<per-arch digest>", ...}}],
      "generic": [{"url": "https://...", "sha256": "<hex>", "arch": "x86_64",
                   "component": "spyre-runtimes"}]}
 Every artifact is tagged with the release's name (in `family`, default `release`), plus
-`release-<date>` and the rolling `release` pointer (both family `release`).
+`release-<date>` and the rolling `release` pointer (both family `release`). List each
+manifest list beside its per-arch images: a consumer that pulled by tag holds only its digest.
 """
 
 import argparse
 import json
 import sys
+from itertools import zip_longest
 from pathlib import Path
 
 from .identity import ArtifactIdentity, DerivedId
@@ -75,6 +79,11 @@ def register_release(client, db: str, manifest: dict, run_url: str = "") -> list
         (f"release-{date}", RELEASE_FAMILY, tag_props),
         ("release", RELEASE_FAMILY, tag_props),
     ]
+    # A manifest list's content is its per-arch images, recorded as `<arch>=<digest>`.
+    deps = [
+        [f"{a}={d}" for a, d in sorted(i.get("manifests", {}).items())]
+        for i in manifest.get("images", [])
+    ]
     return [
         ArtifactWriter.insert_artifact(
             client,
@@ -82,10 +91,13 @@ def register_release(client, db: str, manifest: dict, run_url: str = "") -> list
             identity,
             origin="promoted",
             sources=sources,
+            identity_deps=identity_deps,
             props={"release": name, "run_url": run_url, "source": "release"},
             tags=tags,
         )
-        for identity in release_identities(manifest)
+        for identity, identity_deps in zip_longest(
+            release_identities(manifest), deps, fillvalue=[]
+        )
     ]
 
 
