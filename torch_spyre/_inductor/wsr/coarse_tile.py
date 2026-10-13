@@ -132,7 +132,7 @@ from ..pass_utils import (
 from ..ir import FixedTiledLayout, SpyreConstantFallback, _resize_device_layout
 from .tile import compute_tile_index, compute_tile_stride, decompose_index_for_tiling
 
-logger = get_inductor_logger("coarse_tile")
+logger = get_inductor_logger("wsr.coarse_tile")
 
 
 class _RetiledBufferInfo(NamedTuple):
@@ -696,6 +696,26 @@ def _compute_full_ranges_planned(
     return ranges
 
 
+def _planned_full_device_layout(
+    op: ComputedBuffer, full_ranges: list[Expr]
+) -> SpyreTensorLayout | None:
+    """The device layout a copy-out's full buffer or a reduction's full
+    accumulator takes: ``op``'s own, read before ``_divide_ranges`` replaces it
+    with the tile's.
+
+    ``None`` when ``op`` has no device layout yet (pre-stickify), or when the
+    full buffer is not ``op``'s own shape -- a WhileLoop-splice dim, which
+    ``_compute_full_ranges_planned`` multiplies up. ``_allocate_full_buffer``
+    then derives a layout from the tile instead.
+    """
+    layout = op.layout
+    if not isinstance(layout, FixedTiledLayout):
+        return None
+    if list(layout.size) != list(full_ranges):
+        return None
+    return layout.device_layout
+
+
 def _compute_per_tile_ranges_planned(
     op: ComputedBuffer, info: CoarseTileInfo
 ) -> list[Expr]:
@@ -994,6 +1014,9 @@ def _plan_tiling_propagation(
                     full_output_strides=full_output_strides,
                     per_tile_strides=per_tile_strides,
                     carried=carried,
+                    full_output_device_layout=_planned_full_device_layout(
+                        op, full_output_ranges
+                    ),
                 )
                 info.propagation = PropagationPlan(
                     kind="reduction",
@@ -1165,6 +1188,7 @@ def _plan_tiling_propagation(
                 kind="copy_out",
                 full_ranges=full_ranges,
                 full_strides=tuple(op.layout.stride),
+                full_device_layout=_planned_full_device_layout(op, full_ranges),
                 outside_consumer_names=tuple(all_consumer_names),
                 is_graph_output=is_graph_output,
             )
@@ -1802,6 +1826,60 @@ def _capture_predivision_unit_steps(
     return result
 
 
+def _plan_direct_unit_steps(
+    operations: list[Operation],
+    plan: dict[int, CoarseTileInfo],
+) -> None:
+    """Move each read's unit-tile dims from ``tiled_dims_per_read`` to
+    ``squeezed_advance_per_read``, for a tiling that inserts no read copies.
+
+    A dim tiled down to a per-tile extent of 1 loses its ``d{i}`` symbol when
+    ``_apply_plan`` divides the op, and the surviving symbols are renumbered.
+    ``SpyreKernel._general_tile_advance`` substitutes into the divided
+    ``dep.index``, so a ``tiled_dims_per_read`` entry for such a dim would
+    advance whichever dim inherited its number, by that dim's stride. The step
+    is known only now, while the read index still has the dim, so it is
+    recorded here as the ``(host_stride, extent)`` term the squeezed channel
+    carries.
+
+    With read copies (``coarse_tile_pre_stickify``) the same step goes to the
+    read-copy planner instead: see ``_capture_predivision_unit_steps``. Must run
+    after ``_plan_tiling_propagation``, which empties the entries of reads that
+    stay on a producer's per-tile scratch and so do not advance.
+    """
+    for op in operations:
+        if not isinstance(op, ComputedBuffer):
+            continue
+        info = plan.get(id(op))
+        if info is None or not info.tiled_dims_per_read:
+            continue
+        read_deps = [
+            dep for dep in op.get_read_writes().reads if isinstance(dep, MemoryDep)
+        ]
+        steps_per_read = [
+            _predivision_unit_steps_for_dep(dep, tiled_dims, op)
+            for dep, tiled_dims in zip(read_deps, info.tiled_dims_per_read)
+        ]
+        if not any(any(steps) for steps in steps_per_read):
+            continue
+        squeezed_per_read = info.squeezed_advance_per_read or [
+            [[] for _ in info.loop_count] for _ in read_deps
+        ]
+        for dep_idx, steps in enumerate(steps_per_read):
+            if not any(steps):
+                continue
+            unit_dims = {dim for level in steps for dim, _stride, _extent in level}
+            info.tiled_dims_per_read[dep_idx] = [
+                [(dim, extent) for dim, extent in level if dim not in unit_dims]
+                for level in info.tiled_dims_per_read[dep_idx]
+            ]
+            squeezed_per_read[dep_idx] = [
+                [*squeezed, *((stride, extent) for _dim, stride, extent in level)]
+                for squeezed, level in zip(squeezed_per_read[dep_idx], steps)
+            ]
+        info.squeezed_advance_per_read = squeezed_per_read
+
+
 def _select_unit_steps(
     *,
     op_name: str,
@@ -2400,11 +2478,21 @@ def reduction_loop_vars(op: ComputedBuffer) -> list[sympy.Symbol]:
 def _loop_var_to_reduction_ranges_pos(
     op: ComputedBuffer, sym: sympy.Symbol
 ) -> int | None:
-    """Return position of loop variable sym in op.data.reduction_ranges, or None."""
-    try:
-        return reduction_loop_vars(op).index(sym)
-    except ValueError:
+    """Return position of loop variable sym in op.data.reduction_ranges, or None.
+
+    ``reduction_loop_vars`` is *squeezed*: Inductor mints no loop variable for a
+    size-1 dim (``SqueezeView.squeezer``, whose ``!= 1`` test this mirrors), so
+    the k-th reduction loop variable belongs to the k-th reduction dim whose
+    extent is not 1. None also when the loop variables do not pair one-to-one
+    with those dims, since no position is then trustworthy.
+    """
+    red_vars = reduction_loop_vars(op)
+    if sym not in red_vars:
         return None
+    not_one = [i for i, r in enumerate(op.data.reduction_ranges) if r != 1]
+    if len(not_one) < len(red_vars):
+        return None
+    return not_one[red_vars.index(sym)]
 
 
 def _loop_var_hinted_ranges(op: ComputedBuffer) -> dict[int, Expr]:
@@ -2771,6 +2859,11 @@ def _divide_ranges(
     # get_read_writes() result (pass_utils.op_read_writes) is stale
     # regardless of which capture path (if any) runs below -- invalidate
     # unconditionally rather than only inside the symbol-remap branch.
+    # That disagreement is unreachable when coarse tiling runs
+    # pre-stickification (nothing has populated the memo yet), but the
+    # solver-driven path applies tilings *during* scratchpad planning, after
+    # the first solve has memoized every op -- where it surfaced as
+    # ``coarse_tile_local_dim_split_domains``'s extent assertion.
     invalidate_op_read_writes(op)
 
     symbol_remap = None
@@ -2829,8 +2922,15 @@ def _divide_ranges(
     # _resize_device_layout does not have to infer it by size (ambiguous for
     # transposed same-size dims — issue #3116). Tiling-invariant, so safe here.
     stick_hd = _stick_host_dim(op, layout.device_layout)
+    # The real strides, not the contiguous ones of the two sizes: this op may
+    # write its output in a permuted order, and its stride_map follows that.
     layout.device_layout = _resize_device_layout(
-        layout.device_layout, old_host_size, new_size_ints, stick_host_dim=stick_hd
+        layout.device_layout,
+        old_host_size,
+        new_size_ints,
+        stick_host_dim=stick_hd,
+        old_host_stride=[int(s) for s in old_stride],
+        new_host_stride=[int(s) for s in layout.stride],
     )
     return _DivideRangesResult(retiled_info, symbol_remap)
 
@@ -2951,6 +3051,21 @@ def _apply_plan(
         return {}
 
     _validate_contiguous(ops, op_to_position, stamped_group_id)
+
+    # The stamp below replaces loop_info wholesale, so an op some earlier tiling
+    # already stamped (a for_each_tile loop, above all) would silently lose it.
+    already_tiled = [
+        op.get_operation_name()
+        for op in ops
+        if isinstance(op, ComputedBuffer)
+        and id(op) in plan
+        and getattr(op, "loop_info", None) is not None
+    ]
+    if already_tiled:
+        raise Unsupported(
+            f"coarse_tile: group {stamped_group_id} would overwrite the existing "
+            f"loop_info of {', '.join(already_tiled)}."
+        )
 
     retiled_infos: dict[str, _RetiledBufferInfo] = {}
     for op in ops:
@@ -3095,6 +3210,10 @@ def _coarse_tile_common(
     # / copy-out / reduction) with zero mutation, consumed by Pass 1/2/3
     # below.
     _plan_tiling_propagation(operations, groups, plan)
+    if not run_read_copies:
+        # No read copy will carry a unit-tile dim's step, so the op's own
+        # reads must.
+        _plan_direct_unit_steps(operations, plan)
     _log_propagation_plan(groups, plan)
 
     # Transformation: apply the plan. Only reached if planning didn't raise.
@@ -3780,7 +3899,12 @@ def _propagate_tiled_op(
         == outer_key
     )
     full_buf = _allocate_full_buffer(
-        op, full_ranges, full_strides, operations, group_start_idx
+        op,
+        full_ranges,
+        full_strides,
+        operations,
+        group_start_idx,
+        full_device_layout=propagation.full_device_layout,
     )
 
     # Capture before _insert_copy_op overwrites op.layout.
@@ -4087,6 +4211,7 @@ def _allocate_full_buffer(
     full_strides: tuple[Expr, ...],
     operations: list[Operation],
     insert_at_idx: int,
+    full_device_layout: SpyreTensorLayout | None = None,
 ) -> ComputedBuffer:
     """Allocate a full-sized HBM buffer for the tiled op's original shape.
 
@@ -4094,6 +4219,12 @@ def _allocate_full_buffer(
     a layout matching tiled_op's layout type (FixedLayout pre-stickify,
     FixedTiledLayout post-stickify), splices it into operations at
     insert_at_idx, and returns the new ComputedBuffer.
+
+    ``full_device_layout`` is the device layout planning recorded for the full
+    buffer (``PropagationPlan.full_device_layout`` for a copy-out,
+    ``ReductionPlan.full_output_device_layout`` for an accumulator). Without
+    one, the layout is grown from the tile's, which is only sound while at most
+    one host dim of the tile has extent 1.
     """
     from ..ir import SpyreEmptyFallback  # deferred: avoids circular import
 
@@ -4129,7 +4260,18 @@ def _allocate_full_buffer(
     orig_layout = tiled_op.layout
     strides: list[Expr] = list(full_strides)
 
-    if isinstance(orig_layout, FixedTiledLayout):
+    layout: FixedTiledLayout | FixedLayout
+    if isinstance(orig_layout, FixedTiledLayout) and full_device_layout is not None:
+        # Post-stickify path, with the full buffer's device layout planned: it
+        # is the layout the op's output had before it was divided.
+        layout = FixedTiledLayout(
+            device,
+            dtype,
+            list(full_ranges),
+            strides,
+            full_device_layout,
+        )
+    elif isinstance(orig_layout, FixedTiledLayout):
         # Post-stickify path (span-overflow groups): stickification has already
         # run, so we must assign a FixedTiledLayout now.  Derive the full
         # buffer's device layout by scaling the per-tile device layout up to
@@ -4140,11 +4282,16 @@ def _allocate_full_buffer(
         # None falls back to size-based inference inside _resize_device_layout.
         stick_hd = _stick_host_dim(tiled_op, orig_layout.device_layout)
         try:
+            # The tile's real strides and the full buffer's, as _divide_ranges
+            # passes them the other way: a tile written in a permuted order
+            # grows back along the dims it was shrunk on.
             device_layout = _resize_device_layout(
                 orig_layout.device_layout,
                 tile_size_ints,
                 full_size_ints,
                 stick_host_dim=stick_hd,
+                old_host_stride=[int(s) for s in orig_layout.stride],
+                new_host_stride=[int(s) for s in strides],
             )
         except RuntimeError:
             # Non-standard device layout (e.g. post-restickify HBM strides that
@@ -4166,7 +4313,7 @@ def _allocate_full_buffer(
                 list(range(ndim_full)),
                 orig_layout.device_layout.element_arrangement,
             )
-        layout: FixedTiledLayout | FixedLayout = FixedTiledLayout(
+        layout = FixedTiledLayout(
             device,
             dtype,
             list(full_ranges),
@@ -4549,6 +4696,7 @@ def _rescale_index(
     full_strides: list[Expr],
     tile_strides: list[Expr],
     strip_constant: bool = False,
+    reject_ambiguous: bool = False,
 ) -> Expr:
     """Rescale an affine index's per-dimension coefficients.
 
@@ -4559,7 +4707,9 @@ def _rescale_index(
     coefficient replaced by the matching entry in `tile_strides`. Matching
     is by coefficient value rather than by variable identity because the
     variables `index` is expressed in are not known in advance -- see
-    _NameSwapHandler.
+    _NameSwapHandler.  When ``reject_ambiguous`` is true, a term that could
+    name multiple equal-stride dimensions is accepted only if every match
+    maps to the same target stride.
 
     Each additive term is matched against a candidate `full_stride` by
     dividing the term by it and checking the quotient is free of the
@@ -4661,17 +4811,42 @@ def _rescale_index(
             if not strip_constant:
                 new_index += term
             continue
-        for i, (full_stride, tile_stride) in enumerate(remaining):
-            matched, loop_var_part = _divides_evenly(term, full_stride)
-            if matched:
-                new_index += tile_stride * loop_var_part
-                del remaining[i]
-                break
-        else:
+        if not reject_ambiguous:
+            for i, (full_stride, tile_stride) in enumerate(remaining):
+                matched, loop_var_part = _divides_evenly(term, full_stride)
+                if matched:
+                    new_index += tile_stride * loop_var_part
+                    del remaining[i]
+                    break
+            else:
+                raise RuntimeError(
+                    f"_rescale_index: no matching full_stride for term {term} "
+                    f"in index {index}; full_strides={full_strides}"
+                )
+            continue
+
+        matches = [
+            (i, tile_stride, loop_var_part)
+            for i, (full_stride, tile_stride) in enumerate(remaining)
+            if (match := _divides_evenly(term, full_stride))[0]
+            for loop_var_part in (match[1],)
+        ]
+        if not matches:
             raise RuntimeError(
                 f"_rescale_index: no matching full_stride for term {term} "
                 f"in index {index}; full_strides={full_strides}"
             )
+        if reject_ambiguous and any(
+            sympy.simplify(tile_stride - matches[0][1]) != 0
+            for _i, tile_stride, _loop_var_part in matches[1:]
+        ):
+            raise RuntimeError(
+                f"_rescale_index: ambiguous full_stride for term {term} "
+                f"in index {index}; full_strides={full_strides}"
+            )
+        i, tile_stride, loop_var_part = matches[0]
+        new_index += tile_stride * loop_var_part
+        del remaining[i]
     return new_index
 
 
@@ -6191,6 +6366,8 @@ def _insert_combine_op(
         tiled_op_info,
         tiled_dims_per_read=tiled_dims_per_read,
         output_tiled_dims=output_tiled_dims,
+        # tiled_op's entries are for tiled_op's reads, not these two.
+        squeezed_advance_per_read=[],
     )
     V.graph.name_to_buffer[combine_name] = combine_buf
 
@@ -6545,6 +6722,7 @@ def _propagate_tiled_reduction_op(
             reduction_plan.full_output_strides,
             operations,
             group_start_idx,
+            full_device_layout=reduction_plan.full_output_device_layout,
         )
         group_start_idx_after_full = operations.index(accum_full) + 1
         accum_tile = _allocate_full_buffer(
@@ -6564,6 +6742,7 @@ def _propagate_tiled_reduction_op(
             reduction_plan.full_output_strides,
             operations,
             group_start_idx,
+            full_device_layout=reduction_plan.full_output_device_layout,
         )
         fill_target = accum_full
         combine_target = accum_full

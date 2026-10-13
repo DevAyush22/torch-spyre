@@ -20,12 +20,12 @@ import tempfile
 from typing import Tuple
 
 import pytest
-from torch.testing._internal.common_utils import TestCase
 import torch
 import torch._dynamo
-import torch_spyre
-
 from test_prepare_kernel import TestPrepareKernel as tpk
+from torch.testing._internal.common_utils import TestCase
+
+import torch_spyre
 
 
 def _run_compiled_op(op_name: str) -> None:
@@ -303,7 +303,9 @@ class TestSymbolicArg(TestCase):
 
             stream = torch.Stream("spyre")
             with stream:
-                with pytest.raises(RuntimeError, match="tensor_id=5 out of range"):
+                with pytest.raises(
+                    RuntimeError, match="symbolic_args tensor_id out of range"
+                ):
                     torch_spyre._C.launch_jobplan(job_plan, [t], symbolic_args=payload)
 
     def test_kaddress_ordering_forward_and_reversed_differ(self):
@@ -311,8 +313,8 @@ class TestSymbolicArg(TestCase):
         resolved vectors, each matching the expected per-slot address.
 
         Uses _resolve_symbolic_args, which calls
-        JobPlanStepHostCompute::resolveSymbolicArgs — the same function used
-        by the typed-payload resolution path at launch time — so the result is
+        JobPlanStepHostCompute::resolveSymbolicArgs -- the same function used
+        by the typed-payload resolution path at launch time -- so the result is
         identical to what would be passed to deeptools.
         """
         t0 = torch.zeros(64, dtype=torch.float16, device="spyre")
@@ -329,7 +331,7 @@ class TestSymbolicArg(TestCase):
             [t1], [torch_spyre._C.SymbolicArg(kind=kAddr, tensor_id=0)]
         )[0]
 
-        # Tensors must be at distinct addresses — if they coincidentally share
+        # Tensors must be at distinct addresses -- if they coincidentally share
         # one the reversed payload would produce the same vector and the
         # ordering assertion would be meaningless.
         self.assertNotEqual(
@@ -357,7 +359,7 @@ class TestSymbolicArg(TestCase):
             "Forward and reversed payloads produced identical resolved vectors",
         )
 
-        # Forward: slot 0 → t0, slot 1 → t1.
+        # Forward: slot 0 -> t0, slot 1 -> t1.
         self.assertEqual(
             resolved_fwd[0], addr_t0, "slot 0 of forward payload must be addr_t0"
         )
@@ -365,7 +367,7 @@ class TestSymbolicArg(TestCase):
             resolved_fwd[1], addr_t1, "slot 1 of forward payload must be addr_t1"
         )
 
-        # Reversed: slot 0 → t1, slot 1 → t0.
+        # Reversed: slot 0 -> t1, slot 1 -> t0.
         self.assertEqual(
             resolved_rev[0], addr_t1, "slot 0 of reversed payload must be addr_t1"
         )

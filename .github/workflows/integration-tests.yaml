@@ -80,7 +80,7 @@ on:
       test_type:
         description: >-
           Suite subset to run: smoke | unit | integration | regression |
-          trunk | suite_<group> | <label>. These tier names ARE the
+          trunk | model_ops | suite_<group> | <label>. These tier names ARE the
           test_suite_config.labels vocabulary directly (no alias layer).
           Default: integration (configs whose test_suite_config.labels cover
           the device-layer surfaces flex and deeptools exercise most
@@ -195,7 +195,9 @@ jobs:
       checkout_pytorch: false
       ref: ${{ inputs.ref || '' }}
       repository: ${{ inputs.repository || '' }}
-      test_type: ${{ inputs.test_type || 'integration' }}
+      # model_ops: the model-ops capability suites, selected as model-ops-tests selects them.
+      test_type: ${{ inputs.test_type == 'model_ops' && 'trunk' || inputs.test_type || 'integration' }}
+      config_dir: ${{ inputs.test_type == 'model_ops' && 'model_ops_tests' || '' }}
       prebaked_image: ${{ inputs.prebaked_image }}
     # ClickHouse connection for the perf job's inline benchmark ingest. Passed
     # explicitly (not `secrets: inherit`) so only what _test_matrix declares is
@@ -213,6 +215,7 @@ jobs:
       CLICKHOUSE_USER: ${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_USER || secrets.CLICKHOUSE_USER_DEV }}
       CLICKHOUSE_PASS: ${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_PASS || secrets.CLICKHOUSE_PASS_DEV }}
       CLICKHOUSE_DB: ${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_DB || secrets.CLICKHOUSE_DB_DEV }}
+      CLICKHOUSE_DB_V2: ${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_DB_V2 || secrets.CLICKHOUSE_DB_V2_DEV }}
 
   # ----------------------------------------------------------------------------------
   # Fan-in gate job which is similar to run-spyre-unit-tests in torch_spyre_tests.yaml
