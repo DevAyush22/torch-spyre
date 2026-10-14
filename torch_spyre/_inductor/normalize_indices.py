@@ -39,6 +39,7 @@ preferable to an address that takes the card down.
 import torch
 from torch.fx import Graph, Node
 
+from . import config
 from .logging_utils import get_inductor_logger
 
 logger = get_inductor_logger("normalize_indices")
@@ -192,7 +193,12 @@ def _wrap(graph: Graph, before: Node, idx: Node, size: int) -> Node:
 
 
 def normalize_negative_indices(graph: Graph) -> None:
-    """Wrap every possibly-negative index of an advanced-indexing op."""
+    """Wrap every possibly-negative index of an advanced-indexing op.
+
+    No-op unless ``config.wrap_negative_indices`` is set.
+    """
+    if not config.wrap_negative_indices:
+        return
     for node in graph.nodes:
         if node.op != "call_function" or node.target not in _INDEX_OPS:
             continue

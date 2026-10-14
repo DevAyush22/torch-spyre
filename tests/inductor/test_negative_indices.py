@@ -23,6 +23,7 @@ import unittest
 
 import torch
 
+from torch_spyre._inductor import config
 from utils_inductor import compare_with_cpu
 
 INDEX_DTYPES = (torch.int64, torch.int32)
@@ -54,6 +55,7 @@ def compare(fn, *args):
     compare_with_cpu(fn, *args, atol=0, rtol=0, run_eager=False)
 
 
+@config.patch({"wrap_negative_indices": True})
 class TestNegativeIndexing(unittest.TestCase):
     def setUp(self):
         super().setUp()

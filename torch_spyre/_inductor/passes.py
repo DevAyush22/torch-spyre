@@ -266,6 +266,10 @@ class CustomPrePasses(_SpyreGraphPassPipeline):
         # The index wrap must land in a real buffer, so it runs before lowering.
         super().__init__([normalize_negative_indices, collect_spyre_hints])
 
+    def uuid(self) -> Any | None:
+        # Include the flag so the Inductor cache key changes when it is toggled.
+        return (super().uuid(), config.wrap_negative_indices)
+
 
 class CustomPostPasses(_SpyreGraphPassPipeline):
     """
