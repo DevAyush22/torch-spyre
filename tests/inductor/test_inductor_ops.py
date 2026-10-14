@@ -406,9 +406,15 @@ TO_DTYPE_OP_PARAMS_SETS = {
 
 
 _DTYPE_OP_ALL_OPS_FAIL_SHAPES = {(4, 68), (68,)}
-# fp32 and int32 share a stick width, so their conversions have no stick pairs to
-# keep together and are exempt from the shapes above.
-_SAME_WIDTH_PAIRS = [(torch.float32, torch.int32), (torch.int32, torch.float32)]
+# Pairs sharing a stick width have no stick pairs to keep together, so they are
+# exempt from the shapes above. int64 qualifies: it maps to the same 32-bit
+# device format as int32, so the cast is a byte copy.
+_SAME_WIDTH_PAIRS = [
+    (torch.float32, torch.int32),
+    (torch.int32, torch.float32),
+    (torch.int64, torch.int32),
+    (torch.int32, torch.int64),
+]
 
 TO_DTYPE_OP_EXPECT_FAIL = [
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}"
