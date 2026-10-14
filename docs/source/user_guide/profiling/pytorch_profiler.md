@@ -190,6 +190,9 @@ The full reference is in the upstream
 
 ## Communication events
 
+Queue waits, manager setup, HDMA resets, and socket barriers have separate
+`aiuComms*` spans.
+
 Host-side communication spans emitted by spyre-comms appear in the trace
 under `aiuComms*` names. Collectives such as allreduce, allgather, and
 broadcast, together with the send, receive, and transfer operations beneath

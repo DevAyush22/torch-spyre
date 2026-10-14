@@ -273,6 +273,18 @@ inline std::string runtimeCbidName(AIUpti_runtime_api_trace_cbid cbid) {
       return "flexRoundTrip";
     case AIUPTI_RUNTIME_TRACE_CBID_AIU_ROUNDTRIP:
       return "aiuRoundtrip";
+    case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_QUEUE_WAIT:
+      return "aiuCommsWorkSchedQueueWait";
+    case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_PREPARE:
+      return "aiuCommsWorkSchedPrepare";
+    case AIUPTI_RUNTIME_TRACE_CBID_WORK_SCHED_PRE_RECORD_RESET:
+      return "aiuCommsWorkSchedPreRecordReset";
+    case AIUPTI_RUNTIME_TRACE_CBID_OOB_BARRIER:
+      return "aiuCommsOobBarrier";
+    case AIUPTI_RUNTIME_TRACE_CBID_HDMA_RESET:
+      return "aiuCommsHdmaReset";
+    case AIUPTI_RUNTIME_TRACE_CBID_HDMA_FIRMWARE_RESET:
+      return "aiuCommsHdmaFirmwareReset";
     case AIUPTI_RUNTIME_TRACE_CBID_WAIT_FOR_QUEUE_CAPACITY:
       return "aiuWaitForQueueCapacity";
     default:
