@@ -4281,9 +4281,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((32,)),
                 ),
                 "3d_table_64_entries": (
-                    cached_randn((8, 64, 32)),
+                    cached_randn((8, 64, 32), abs=True),
                     torch.randint(0, 8, (64,), dtype=torch.int64),
-                    cached_randn((64,)),
+                    cached_randn((64,), abs=True),
                 ),
             },
         },
