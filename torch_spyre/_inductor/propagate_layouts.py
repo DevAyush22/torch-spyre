@@ -239,6 +239,8 @@ def _project_pointwise_dim_order(
     # buffer. Its extra leading axes are fixed by the loop, while the body
     # operates on the trailing axes. Keep those backing axes in the layout
     # permutation and shift the body's order onto the trailing dimensions.
+    # The trailing -1 is the sparse-stick marker and must be preserved as-is,
+    # not shifted (it is not a dimension index).
     leading = list(range(-rank_diff))
     return leading + [(d - rank_diff if d != -1 else d) for d in dim_order]
 
@@ -330,6 +332,38 @@ def _candidate_output_stls(
         if stls:
             break
     return stls
+
+
+def _compatible_output_stick_exprs(
+    stick_expr: sympy.Expr, out_coords, dep: MemoryDep
+) -> list[sympy.Expr]:
+    """Output stick expressions one input can feed without a restickify.
+
+    ``stick_expr`` is the input's device stick coordinate, ``dep`` its load and
+    ``out_coords`` the output's host coordinates. The result starts with
+    ``stick_expr`` itself, the preserved layout.
+
+    A stick of constant 0 is a size-1 stick, which says nothing about where the
+    output's stick goes. For such an input, the coordinate of each output dim it
+    is expanded along is added, e.g. ``d2`` for ``y`` ``[3, 5, 1]`` read through
+    ``y.expand(3, 5, 128)``, or both ``d1`` and ``d2`` for ``[3, 1, 1]`` expanded
+    to ``[3, 64, 128]``. Every lane of a stick on such a dim needs the same input
+    element, which the op broadcasts, so ``stick_compatible`` accepts the pair.
+
+    The consumer picks among the returned sticks, e.g. a full-size operand on the
+    expanded last dim or a transposed one on another expanded dim; the size-1
+    stick stays for a consumer with a size-1 last dim.
+    """
+    if stick_expr != 0:
+        return [stick_expr]
+    in_syms = dep.index.free_symbols
+    # An expanded dim is indexed by a variable the input's load lacks, so the
+    # input's element does not vary along it. A dim the input does index is left
+    # out: a stick there would gather elements from several input sticks.
+    expanded_dim_coords = [
+        coord for coord in out_coords if coord.is_symbol and coord not in in_syms
+    ]
+    return [stick_expr, *expanded_dim_coords]
 
 
 def _check_supported_input_sticks(args: list[PropArg], op_label: str) -> None:
@@ -583,7 +617,23 @@ def _single_arg_op_layout(
 
             input_ea = stl.element_arrangement
 
-            fmt = DtypeOpTable.ea_map(in_layout.dtype, output.dtype, input_ea)
+            # For bool inputs, ea_map must resolve from the physical backing
+            # dtype (e.g. IEEE_FP32 for a fp32-backed bool) rather than the
+            # logical torch.bool, which is not in the EA map. Use the
+            # bool-equivalent dtype of the STL's device_dtype as the source.
+            ea_src_dtype = in_layout.dtype
+            if ea_src_dtype == torch.bool:
+                resolved_dtype = bool_equivalent_dtype(stl.device_dtype)
+                if resolved_dtype is not None:
+                    ea_src_dtype = resolved_dtype
+                else:
+                    logger.warning(
+                        "bool input has unrecognised device_dtype %s; "
+                        "falling back to torch.bool for EA map lookup",
+                        stl.device_dtype,
+                    )
+
+            fmt = DtypeOpTable.ea_map(ea_src_dtype, output.dtype, input_ea)
 
             # Two strategies, chosen by whether a staggered EA is involved:
             #
@@ -715,13 +765,21 @@ def _single_arg_op_layout(
     if in_device_coords is None:
         return []
     stick_expr = in_device_coords[-1]
+    stick_exprs = _compatible_output_stick_exprs(stick_expr, out_coords, dep)
 
     # Try to preserve input layout, fall back to scanning all output dims
-    out_stl = _output_stl_from_stick_expr(
-        stick_expr, output, output_dep, c_size, c_stride, out_dtype_for_layout
-    )
-    if out_stl is not None:
-        return [out_stl]
+    output_stls = [
+        out_stl
+        for expr in stick_exprs
+        for out_stl in [
+            _output_stl_from_stick_expr(
+                expr, output, output_dep, c_size, c_stride, out_dtype_for_layout
+            )
+        ]
+        if out_stl is not None
+    ]
+    if output_stls:
+        return output_stls
     return _candidate_output_stls(
         out_coords,
         output_dep,
@@ -1088,7 +1146,19 @@ def find_stick_compatible_input_layout(
     # so return immediately without checking the stick.
     for stl, dev_coords in candidates:
         if stl.element_arrangement != ElementArrangement.STANDARD:
-            return stl
+            # Non-STANDARD arrangements (QFP8WT etc.) carry their own contraction
+            # structure and are normally returned immediately.  However for
+            # batchmatmulfp8 the activation input (QFP8CH) must have
+            # reduction_var on its stick.  A sparse QFP8CH candidate has
+            # reduction_var on an outer dim, not the stick — returning it here
+            # would propagate an incompatible layout and crash downstream.
+            # Skip it so the loop continues to the next candidate (typically a
+            # dense QFP8CH where K is already on the stick).
+            if reduction_type != BATCH_MATMUL_FP8_OP or (
+                reduction_var in dev_coords[-1].free_symbols
+            ):
+                return stl
+            continue
         if reduction_var not in dev_coords[-1].free_symbols:
             continue
         if reduction_type == BATCH_MATMUL_OP and any(
@@ -1152,102 +1222,6 @@ def find_stick_compatible_input_layout(
 
     raise Unsupported(
         f"{reduction_type}: cannot restickify any input layout of {label} to carry {label}_var={reduction_var}"
-    )
-
-
-def _flat_dense_projection_x_layout(
-    x: PropArg,
-    y: PropArg,
-    output: FixedLayout,
-    output_dep: MemoryDep,
-    reduction_var: sympy.Symbol,
-    m_size: int,
-    n_size: int,
-) -> SpyreTensorLayout | None:
-    """Return a canonical flat-M layout for a logically 2-D dense projection.
-
-    A fused attention producer can retain a higher-rank contiguous host view
-    such as ``[B, L, H, D]`` even though the projection reads it as the logical
-    matrix ``[B*L, H*D]``.  Preserving those physical outer axes makes the
-    backend encode the shared-weight projection as a BMM, which is much slower
-    than the equivalent flat MM.  Collapse only when the complete access is
-    provably one dense row-major 2-D matrix and the weight is shared (rank 2).
-
-    Genuine BMMs retain a rank-3 output and/or a batched weight and therefore do
-    not enter this path.
-    """
-
-    if (
-        m_size <= 1
-        or n_size <= 1
-        or len(output.size) != 2
-        or len(x.layout.size) <= 2
-        or len(y.layout.size) != 2
-        or x.layouts[0].element_arrangement != ElementArrangement.STANDARD
-        or x.layouts[0].device_dtype != DataFormats.SEN169_FP16
-    ):
-        return None
-
-    x_size = [concretize_expr(size) for size in x.layout.size]
-    x_stride = [concretize_expr(stride) for stride in x.layout.stride]
-    y_size = [concretize_expr(size) for size in y.layout.size]
-    out_size = [concretize_expr(size) for size in output.size]
-    out_stride = [concretize_expr(stride) for stride in output.stride]
-
-    def is_dense_contiguous(size: list[int], stride: list[int]) -> bool:
-        expected = 1
-        for dim_size, dim_stride in zip(reversed(size), reversed(stride)):
-            if dim_size != 1 and dim_stride != expected:
-                return False
-            expected *= dim_size
-        return True
-
-    if not is_dense_contiguous(x_size, x_stride) or not is_dense_contiguous(
-        out_size, out_stride
-    ):
-        return None
-
-    active_x_vars = set(x.dep.index.free_symbols) & set(x.dep.ranges)
-    row_vars = active_x_vars - {reduction_var}
-    if reduction_var not in active_x_vars or len(row_vars) != 1:
-        return None
-    (row_var,) = row_vars
-
-    row_size = concretize_expr(x.dep.ranges[row_var])
-    reduction_size = concretize_expr(x.dep.ranges[reduction_var])
-    active_out_vars = set(output_dep.index.free_symbols) & set(output_dep.ranges)
-    generated_vars = active_out_vars - {row_var}
-    if row_var not in active_out_vars or len(generated_vars) != 1:
-        return None
-    (generated_var,) = generated_vars
-    generated_size = concretize_expr(output_dep.ranges[generated_var])
-
-    if (
-        row_size != m_size
-        or generated_size != n_size
-        or math.prod(x_size) != row_size * reduction_size
-        or math.prod(y_size) != reduction_size * generated_size
-        or math.prod(out_size) != m_size * n_size
-        or row_var in y.dep.index.free_symbols
-        or {reduction_var, generated_var}
-        != (set(y.dep.index.free_symbols) & set(y.dep.ranges))
-    ):
-        return None
-
-    expected_index = reduction_size * row_var + reduction_var
-    expected_output_index = generated_size * row_var + generated_var
-    if (
-        sympy.simplify(x.dep.index - expected_index) != 0
-        or sympy.simplify(output_dep.index - expected_output_index) != 0
-    ):
-        return None
-
-    return SpyreTensorLayout(
-        [row_size, reduction_size],
-        [reduction_size, 1],
-        x.layout.dtype,
-        [0, 1],
-        ElementArrangement.STANDARD,
     )
 
 
@@ -1325,7 +1299,6 @@ def _matmul_layouts(
     reduction_var = find_reduction_var((x.dep,), output_dep)
     n_size = get_matmul_n_size(op)
     m_size = get_matmul_m_size(op)
-    exact_input_indices: set[int] = set()
 
     if n_size == 1:
         # N has no loop symbol after size-one simplification, so there is no
@@ -1385,14 +1358,6 @@ def _matmul_layouts(
         out_dims = len(output.size)
         out_stick_dim = _out_stick_dim
 
-    if data.reduction_type == BATCH_MATMUL_OP:
-        flat_x_stl = _flat_dense_projection_x_layout(
-            x, y, output, output_dep, reduction_var, m_size, n_size
-        )
-        if flat_x_stl is not None:
-            x_req_stl = flat_x_stl
-            exact_input_indices.add(0)
-
     out_dim_order = list(range(out_dims - 2))
     if out_stick_dim == out_dims - 1:
         out_dim_order = out_dim_order + [out_dims - 2, out_dims - 1]
@@ -1410,7 +1375,6 @@ def _matmul_layouts(
         [x_req_stl, y_req_stl],
         op,
         output_dep,
-        exact_input_indices=exact_input_indices,
     )
     return [out_stl]
 
@@ -1513,10 +1477,34 @@ def _multi_arg_pointwise_layouts(
        4. Construct the AllSameNode cost function since in and out sticks must always match
     """
 
+    ind_names, _, ind_sizes = indirect_info_from_op(op)
+
+    # An index operand read only at lane 0 of each stick takes no part in the
+    # arrangement: a stagger keeps lane 0 in place, so a staggered index read
+    # there yields the same indices as a standard one. An index with such a
+    # candidate keeps only those candidates, as a broadcast operand below keeps
+    # its broadcast ones, so the solver picks one of them.
+    # TODO: lanes 1-3 and 60-63 are also fixed under the fp16 <-> fp32 stagger.
+    def _lane0_candidates(arg) -> list[SpyreTensorLayout]:
+        return [
+            stl
+            for stl in arg.layouts
+            for coords in [try_device_coordinates(stl, arg.dep, ind_sizes, op=op)]
+            if coords is not None and coords[-1] == 0
+        ]
+
+    ea_args = []
+    for arg in args:
+        lane0 = _lane0_candidates(arg) if arg.dep.name in ind_names else []
+        if lane0:
+            arg.layouts[:] = lane0
+        else:
+            ea_args.append(arg)
+
     # Determine output ElementArrangement from inputs
     # Collect all unique EAs from input SpyreTensorLayouts
     input_eas = set()
-    for arg in args:
+    for arg in ea_args:
         if arg.layouts:
             # Get EA from first SpyreTensorLayout (all should have same EA for this input)
             input_eas.add(arg.layouts[0].element_arrangement)
@@ -1579,13 +1567,13 @@ def _multi_arg_pointwise_layouts(
 
         std_split = [
             (arg, *_broadcast_split(arg))
-            for arg in args
+            for arg in ea_args
             if arg.layouts
             and arg.layouts[0].element_arrangement == ElementArrangement.STANDARD
         ]
         stag_split = [
             (arg, *_broadcast_split(arg))
-            for arg in args
+            for arg in ea_args
             if arg.layouts and arg.layouts[0].element_arrangement == staggered_ea
         ]
 
@@ -1655,14 +1643,18 @@ def _multi_arg_pointwise_layouts(
         # Case 1: all STANDARD (or non-staggered) EAs - use STANDARD.
         output_ea = ElementArrangement.STANDARD
 
-    ind_names, _, ind_sizes = indirect_info_from_op(op)
+    in_coords = [
+        host_coordinates(arg.layout, arg.dep, ind_sizes, op=op) for arg in args
+    ]
+    out_coords = host_coordinates(output, output_dep, ind_sizes, op=op)
     stick_exprs = {
-        dc[-1]
+        stick
         for arg in args
         for stl in arg.layouts
         if arg.dep.name not in ind_names
         for dc in [try_device_coordinates(stl, arg.dep, ind_sizes, op=op)]
         if dc is not None
+        for stick in _compatible_output_stick_exprs(dc[-1], out_coords, arg.dep)
     }
 
     # Bool physical format resolution: see resolve_output_formats's docstring.
@@ -1675,10 +1667,6 @@ def _multi_arg_pointwise_layouts(
 
     # If the indexing and device element size are identical
     # across all inputs and the output we can just propagate the device layout.
-    in_coords = [
-        host_coordinates(arg.layout, arg.dep, ind_sizes, op=op) for arg in args
-    ]
-    out_coords = host_coordinates(output, output_dep, ind_sizes, op=op)
     can_use_same_layout = True
 
     if len(stick_exprs) > 1 or any(len(arg.layouts) > 1 for arg in args):
@@ -2076,9 +2064,6 @@ def compute_layouts(
                 f"views not supported for spyre.layernormnorm({in_layout.size})=>{output.size})"
             )
         return _layernormnorm_layout(op, output, output_dep, args)
-
-    if aten_op == spyreop.compact.default:
-        return _compact_layout(op, output, output_dep, args)
 
     if any(origin.target == aten.clone.default for origin in data.origins):
         # clone materializes a new buffer in a fixed row-major layout regardless of

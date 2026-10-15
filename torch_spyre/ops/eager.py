@@ -16,6 +16,7 @@ import torch
 from torch_spyre._C import fill_tensor, copy_tensor, SpyreTensorLayout
 import torch_spyre.ops.fallbacks  # noqa: F401
 from .fallbacks import _get_op_overloads
+from .warning_types import RetileWarning
 import warnings
 import contextlib
 import functools
@@ -155,11 +156,6 @@ def _materialize_offset_view(x):
     if isinstance(x, (list, tuple)):
         return type(x)(_materialize_offset_view(e) for e in x)
     return x
-
-
-class RetileWarning(UserWarning):
-    """Warning issued when an eager result had to be re-tiled to the layout a
-    compiled graph assumes for it."""
 
 
 warnings.simplefilter("once", RetileWarning)
@@ -492,6 +488,7 @@ COMPILED_OPS = [
     aten.gt,
     aten.lt,
     aten.amax,
+    aten.amin,
     aten.maximum,
     aten.minimum,
     aten.pow,
@@ -740,6 +737,22 @@ def spyre__copy_from(self, dst, non_blocking=False):
     ):
         return dst
 
+    # TODO(issue): D2H ignores the source's element_arrangement and returns
+    # PERMUTED data when the tensor has a staggered EA (e.g. DL16_TO_FP32).
+    #
+    # A stick-reordering typecast (dl16tofp32 / fp32todl16) leaves its result
+    # with a staggered EA: the elements are correct on device and a following
+    # compiled graph consumes them correctly (the EA is stamped on the live
+    # tensor), but copy_tensor below reads the buffer as if it were STANDARD,
+    # so the host gets a permutation of the right answer with no error raised.
+    #
+    # Reachable from plain add/mul on an fp16 x fp32 pair with a stick-dim
+    # broadcaster, and from a bare x.float() returned directly -- which is why
+    # device numerics must be checked as .cpu().float() and never .float().cpu().
+    #
+    # Fix: restickify (or apply the reverse conversion) when
+    # self.device_tensor_layout().element_arrangement is not STANDARD before
+    # calling copy_tensor. The information is already available at this point.
     if (self.device.type == "cpu" and dst.device.type == "spyre") or (
         self.device.type == "spyre" and dst.device.type == "cpu"
     ):
