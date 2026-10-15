@@ -9224,13 +9224,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_fallback_cpu(self, x):
         """
-        Verify that cumsum executes via the CPU fallback path and emits
-        FallbackWarning. Also verifies numerical correctness via compare_with_cpu.
+        Verify that cumsum emits FallbackWarnings and produces correct results.
+
+        For fp16 inputs, cumsum uses the on-device BMM decomposition (spyre_cumsum)
+        which internally calls three CPU-side ops: reshape_and_pad_via_cpu,
+        aten.tril, and slice_and_reshape_via_cpu.
         """
 
         def fn(t):
             t = torch.exp(t)
-            t = torch.cumsum(t.clamp(-1, 1), dim=-1)  # fallback op (aten.cumsum)
+            t = torch.cumsum(t.clamp(-1, 1), dim=-1)
             t = torch.exp(t.clamp(-1, 1))
             return t
 
@@ -9242,10 +9245,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             w
             for w in captured
             if issubclass(w.category, FallbackWarning)
-            and "aten.cumsum" in str(w.message)
+            and "reshape_and_pad_via_cpu" in str(w.message)
         ]
         assert len(fallback_warnings) > 0, (
-            f"Expected FallbackWarning for cumsum (CPU fallback path). "
+            f"Expected FallbackWarning from spyre_cumsum fp16 BMM path "
+            f"(reshape_and_pad_via_cpu). "
             f"All captured: {[str(w.message) for w in captured]}"
         )
 
