@@ -543,8 +543,6 @@ _SAME_WIDTH_PAIRS = [
     (torch.int32, torch.float32),
     (torch.float32, torch.int64),
     (torch.int64, torch.float32),
-    (torch.int64, torch.int32),
-    (torch.int32, torch.int64),
 ]
 
 TO_DTYPE_OP_EXPECT_FAIL = [

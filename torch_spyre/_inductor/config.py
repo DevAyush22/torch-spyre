@@ -261,9 +261,8 @@ ignore_span_overflow_hints: bool = (
     os.environ.get("SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS", "1") == "1"
 )
 
-# Wrap possibly-negative advanced-indexing indices before lowering (issue #4731).
-# Opt-in: set SPYRE_INDUCTOR_WRAP_NEGATIVE_INDICES=1 or
-# config.patch({"wrap_negative_indices": True}).
+# Wrap possibly-negative advanced-indexing indices before lowering. Opt-in:
+# the wrap costs a few ops on every indexed access, including positive ones.
 wrap_negative_indices: bool = (
     os.environ.get("SPYRE_INDUCTOR_WRAP_NEGATIVE_INDICES", "0") == "1"
 )

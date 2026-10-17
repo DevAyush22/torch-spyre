@@ -80,6 +80,10 @@ from torch_spyre._inductor.op_spec import find_unimplemented  # noqa: E402
 from utils_inductor import mock_backend_compiler
 
 
+# Byte width of each format a gather buffer can declare.
+_FORMAT_WORD_LENGTHS = {"SEN169_FP16": 2, "IEEE_FP32": 4, "IEEE_INT32": 4}
+
+
 class _GatherScenarios:
     """torch gather-family ops: one compile + all-stage checks per scenario.
 
@@ -928,11 +932,11 @@ class _GatherScenarios:
                         lds["wordLength"], 4, "index int32 -> wordLength 4"
                     )
                 else:
-                    # Non-index buffers are not all fp16; width follows format.
-                    fmt = lds["dataFormat_"]
-                    expected = 2 if ("FP16" in fmt or "BF16" in fmt) else 4
+                    # Width follows the declared format, which is not always fp16.
+                    fmt = lds["dataFormat_"].split(".")[-1]
+                    self.assertIn(fmt, _FORMAT_WORD_LENGTHS, f"unknown format {fmt}")
                     self.assertEqual(
-                        lds["wordLength"], expected, f"{fmt} -> wordLength {expected}"
+                        lds["wordLength"], _FORMAT_WORD_LENGTHS[fmt], f"{fmt} width"
                     )
 
             index_nodes += [

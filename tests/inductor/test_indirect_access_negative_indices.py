@@ -1,4 +1,4 @@
-# Copyright 2025 The Torch-Spyre Authors.
+# Copyright 2026 The Torch-Spyre Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -105,6 +105,11 @@ class TestNegativeIndexing(unittest.TestCase):
         for dtype in INDEX_DTYPES:
             with self.subTest(dtype=dtype):
                 compare(gather, x, torch.arange(64, dtype=dtype))
+
+    def test_gather_index_built_in_graph(self):
+        """An index built from arange in the graph is already non-negative."""
+        x = values(32, 64)
+        compare(lambda t: t[torch.arange(16, device=t.device)], x)
 
     def test_gather_fused_consumer(self):
         """The index must stay correct once the gather fuses with its consumer."""
