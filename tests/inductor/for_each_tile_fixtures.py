@@ -1031,13 +1031,11 @@ def abs_add_mul_tiled_reference(
 def softmax_row_tiled_fn(X: torch.Tensor, tile_size: int) -> torch.Tensor:
     """Map mode: row-tile dim 0, softmax the (whole, untiled) last dim per tile.
 
-    Mirrors test_hint_softmax_row_tiling's HINT-driven equivalent
-    (test_coarse_tile_e2e.py): reduction lives entirely inside the tile body
-    on the untiled column dim, so a multi-stick tile_size exercises the same
-    per-tile device_size[1] invariant that test documents -- a bug that
-    shrinks the row-stride dimension corrupts all stick groups after the
-    first in each non-first tile, and only shows up once a tile spans more
-    than one stick's worth of columns.
+    The reduction lives entirely inside the tile body on the untiled column
+    dim, so a multi-stick tile_size exercises the per-tile device_size[1]
+    invariant: a bug that shrinks the row-stride dimension corrupts all stick
+    groups after the first in each non-first tile, and only shows up once a
+    tile spans more than one stick's worth of columns.
     """
 
     def body(_, ops):
@@ -1300,6 +1298,7 @@ def _post_grad_graphs():
     so this monkey-patches the (now permanent, #4136-landed) decomposition
     function for the duration of one compile.
     """
+    import torch._inductor.config as inductor_config
     import torch._inductor.fx_passes.post_grad as pg
 
     seen: list[torch.fx.GraphModule] = []
@@ -1312,7 +1311,9 @@ def _post_grad_graphs():
 
     pg.decompose_scan_to_while_loop = wrapper
     try:
-        yield seen
+        # A cache hit skips the post-grad passes, so nothing would be captured.
+        with inductor_config.patch(force_disable_caches=True):
+            yield seen
     finally:
         pg.decompose_scan_to_while_loop = original
 
@@ -1367,6 +1368,39 @@ def consumed_row_fn(table: torch.Tensor) -> torch.Tensor:
     acc0 = torch.zeros_like(table[0])
     final, _ = for_each_tile(body, (table,), dims=(0,), tile_size=1, init=acc0)
     return final
+
+
+def scatter_carry_fn(values, indices, output, *, transpose_source=False):
+    from torch_spyre._inductor.wsr import for_each_tile
+
+    def body(carry, tiles):
+        acc, dst = carry
+        value, ids = tiles
+        updated = acc + value[0]
+        source = updated.permute(2, 0, 1) if transpose_source else updated
+        return (updated, dst.index_copy(0, ids[0], source)), None
+
+    (_, result), _ = for_each_tile(
+        body,
+        (values, indices),
+        dims=(0, 0),
+        tile_size=1,
+        init=(torch.zeros_like(values[0]), output),
+    )
+    return result
+
+
+def scatter_carry_old_value_fn(values, indices, output):
+    from torch_spyre._inductor.wsr import for_each_tile
+
+    def body(dst, tiles):
+        value, ids = tiles
+        new = dst.index_copy(0, ids[0], value[0])
+        return new, dst.sum(dim=0).unsqueeze(0)
+
+    return for_each_tile(
+        body, (values, indices), dims=(0, 0), tile_size=1, init=output, out_dim=0
+    )
 
 
 # ---------------------------------------------------------------------------

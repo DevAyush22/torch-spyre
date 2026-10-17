@@ -48,6 +48,8 @@ from unittest import mock
 import torch
 from torch._inductor.virtualized import V
 
+from utils_inductor import expects_raise
+
 from for_each_tile_fixtures import (
     PAGE_HS,
     PAGE_LQ,
@@ -292,6 +294,50 @@ class TestIndirectIndexStepGuard(unittest.TestCase):
 
         SpyreKernel._check_indirect_index_step(None, self._arg(None))
 
+    @expects_raise
+    def test_interleaved_multi_stick_index_row_is_refused(self):
+        import sympy
+
+        from torch_spyre._inductor.errors import Unsupported
+        from torch_spyre._inductor.spyre_kernel import SpyreKernel
+
+        row, level = sympy.symbols("row L0", integer=True)
+        arg = self._arg(32 * level)
+        arg.device_size = [2, 4, 32]
+        arg.device_coordinates = [
+            sympy.floor(row / 32),
+            sympy.S.Zero,
+            sympy.Mod(row, 32),
+        ]
+        with self.assertRaisesRegex(
+            Unsupported, "index rows require adjacent physical sticks"
+        ):
+            SpyreKernel._check_indirect_index_step(None, arg)
+
+    def test_adjacent_multi_stick_index_row_is_allowed(self):
+        import sympy
+
+        from torch_spyre._inductor.spyre_kernel import SpyreKernel
+
+        row, level = sympy.symbols("row L0", integer=True)
+        for sizes, coordinates in (
+            ([4, 2, 32], [0, sympy.floor(row / 32), sympy.Mod(row, 32)]),
+            ([2, 1, 32], [sympy.floor(row / 32), 0, sympy.Mod(row, 32)]),
+            (
+                [2, 2, 32],
+                [
+                    sympy.floor(row / 64),
+                    sympy.Mod(sympy.floor(row / 32), 2),
+                    sympy.Mod(row, 32),
+                ],
+            ),
+        ):
+            with self.subTest(sizes=sizes):
+                arg = self._arg(64 * level)
+                arg.device_size = sizes
+                arg.device_coordinates = [sympy.sympify(c) for c in coordinates]
+                SpyreKernel._check_indirect_index_step(None, arg)
+
 
 class TestPerTripIndex(unittest.TestCase):
     """``per_trip_index`` pins a spliced loop's trip counter to zero.
@@ -359,6 +405,150 @@ class TestPerTripIndex(unittest.TestCase):
 
 
 class TestSpliceWhileLoop(unittest.TestCase):
+    def test_scatter_clone_elision_requires_identity_and_exclusive_reader(self):
+        from torch._inductor import ir
+        from torch._inductor.sizevars import SizeVarAllocator
+
+        import torch_spyre._inductor.wsr.while_loop_bridge as bridge
+
+        for case in (
+            "identity",
+            "computed_value",
+            "other_input",
+            "ranges",
+            "clone_size",
+            "update_size",
+            "clone_stride",
+            "update_stride",
+            "clone_offset",
+            "update_offset",
+            "dtype",
+            "update_dtype",
+            "indexer",
+            "extra_reader",
+            "unknown_reader",
+            "two_updates",
+        ):
+            with self.subTest(case=case):
+
+                def layout():
+                    return ir.FixedLayout(
+                        torch.device("cpu"), torch.float32, [4, 8], [8, 1]
+                    )
+
+                placeholder = ir.InputBuffer(name="carry", layout=layout())
+                storage = ir.InputBuffer(name="storage", layout=layout())
+                clone_layout = layout()
+                update_layout = layout()
+                if case.startswith("clone_") or (
+                    case.startswith("update_") and case != "update_dtype"
+                ):
+                    which, field = case.split("_")
+                    changed = clone_layout if which == "clone" else update_layout
+                    setattr(
+                        changed,
+                        field,
+                        {"size": [8, 4], "stride": [1, 4], "offset": 1}[field],
+                    )
+                if case == "dtype":
+                    clone_layout.dtype = torch.float16
+                if case == "update_dtype":
+                    update_layout.dtype = torch.float16
+
+                def load(index):
+                    value = V.ops.load(
+                        "other" if case == "other_input" else "carry",
+                        8 * index[0] + index[1] + int(case == "indexer"),
+                    )
+                    return V.ops.neg(value) if case == "computed_value" else value
+
+                clone = ir.ComputedBuffer(
+                    name="clone",
+                    layout=clone_layout,
+                    data=ir.Pointwise(
+                        device=torch.device("cpu"),
+                        dtype=clone_layout.dtype,
+                        inner_fn=load,
+                        ranges=[2, 8] if case == "ranges" else [4, 8],
+                    ),
+                )
+                clone.operation_name = "clone_op"
+                graph = mock.Mock()
+                graph.sizevars = SizeVarAllocator()
+                graph.operations = []
+                graph.graph_outputs = []
+                graph.name_to_buffer = {
+                    "carry": placeholder,
+                    "storage": storage,
+                    "clone": clone,
+                }
+                graph.name_to_op = {"clone_op": clone}
+                graph.get_dtype = lambda name: graph.name_to_buffer[name].get_dtype()
+                while_op = mock.Mock()
+                while_op.body_subgraph.graph.graph_inputs = {"carry": placeholder}
+
+                with V.set_graph_handler(graph):
+                    update = ir.ComputedBuffer(
+                        name="scatter",
+                        layout=ir.MutationLayoutSHOULDREMOVE(
+                            ir.ReinterpretView(
+                                data=ir.StorageBox(clone), layout=update_layout
+                            )
+                        ),
+                        data=ir.Scatter(
+                            device=torch.device("cpu"),
+                            dtype=torch.float32,
+                            ranges=[2, 8],
+                            inner_fn=lambda index: V.ops.load(
+                                "values", 8 * index[0] + index[1]
+                            ),
+                            output_indexer=lambda index: [
+                                V.ops.indirect_indexing(
+                                    V.ops.load("ids", index[0]), 4, check=False
+                                ),
+                                index[1],
+                            ],
+                        ),
+                    )
+                    update.operation_name = "scatter_op"
+                    body = [clone, update]
+                    if case in ("extra_reader", "unknown_reader"):
+                        reader = ir.ComputedBuffer(
+                            name="reader",
+                            layout=layout(),
+                            data=ir.Pointwise(
+                                device=torch.device("cpu"),
+                                dtype=torch.float32,
+                                inner_fn=lambda index: V.ops.load(
+                                    "carry", 8 * index[0] + index[1]
+                                ),
+                                ranges=[4, 8],
+                            ),
+                        )
+                        reader.operation_name = "reader_op"
+                        if case == "unknown_reader":
+                            reader = mock.Mock(spec=["get_read_writes", "inputs"])
+                            reader.inputs = []
+                            reader.get_read_writes = mock.Mock(
+                                side_effect=NotImplementedError
+                            )
+                        body.append(reader)
+                    if case == "two_updates":
+                        body.append(update)
+                    binding = bridge.CarryBinding(0, storage, clone, "scratch")
+                    result = bridge._rewire_accumulator_output(
+                        graph, while_op, binding, body, storage
+                    )
+
+                if case == "identity":
+                    self.assertEqual(result, [update])
+                    self.assertIs(update.layout.get_buffer(), storage)
+                    self.assertFalse(hasattr(storage, "_loop_carry_record"))
+                else:
+                    self.assertIs(result[0], clone)
+                    self.assertIs(clone.layout.get_buffer(), storage)
+                    self.assertEqual(storage._loop_carry_record.update_name, "clone")
+
     def test_accumulator_view_tags_backing_storage(self):
         """A view-backed carry records ownership on its mutable Buffer."""
         from torch._inductor import ir
@@ -1538,7 +1728,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
 
         from torch_spyre._inductor.wsr import for_each_tile
         from torch_spyre._inductor.wsr.for_each_tile_lowering import (
-            _identity_load,
+            identity_load,
             splice_while_loops,
         )
 
@@ -1570,7 +1760,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
                 (op, identity)
                 for op in graph.operations
                 if isinstance(op, ir.ComputedBuffer)
-                and (identity := _identity_load(op)) is not None
+                and (identity := identity_load(op)) is not None
             ]
             input_copies = [
                 (op, identity)
@@ -1609,13 +1799,13 @@ class TestSpliceWhileLoops(unittest.TestCase):
                     self.assertEqual(dep.index.coeff(loop_var), 0)
 
             non_identity_readers = [
-                reader for reader in direct_readers if _identity_load(reader) is None
+                reader for reader in direct_readers if identity_load(reader) is None
             ]
             self.assertEqual(
                 len(non_identity_readers),
                 1,
                 [
-                    (reader.get_name(), _identity_load(reader))
+                    (reader.get_name(), identity_load(reader))
                     for reader in direct_readers
                 ],
             )
@@ -1640,7 +1830,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
 
         from torch_spyre._inductor.wsr import for_each_tile
         from torch_spyre._inductor.wsr.for_each_tile_lowering import (
-            _identity_load,
+            identity_load,
             splice_while_loops,
         )
 
@@ -1682,7 +1872,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
                 (op, identity)
                 for op in graph.operations
                 if isinstance(op, ir.ComputedBuffer)
-                and (identity := _identity_load(op)) is not None
+                and (identity := identity_load(op)) is not None
             ]
             input_copies = [
                 (op, identity)
@@ -1746,7 +1936,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
 
         from torch_spyre._inductor.wsr import for_each_tile
         from torch_spyre._inductor.wsr.for_each_tile_lowering import (
-            _identity_load,
+            identity_load,
             splice_while_loops,
         )
 
@@ -1789,7 +1979,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
                 (op, identity)
                 for op in graph.operations
                 if isinstance(op, ir.ComputedBuffer)
-                and (identity := _identity_load(op)) is not None
+                and (identity := identity_load(op)) is not None
             ]
             input_copies = [
                 (op, identity)
@@ -1900,7 +2090,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
     def test_identity_recognition_declines_an_untraceable_pointwise(self):
         from torch._inductor import ir
 
-        from torch_spyre._inductor.wsr.for_each_tile_lowering import _identity_load
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import identity_load
 
         def unsupported_inner(_index):
             raise RuntimeError("not executable by the identity recorder")
@@ -1918,7 +2108,7 @@ class TestSpliceWhileLoops(unittest.TestCase):
             ),
         )
 
-        self.assertIsNone(_identity_load(op))
+        self.assertIsNone(identity_load(op))
 
     def test_identity_chain_declines_a_flat_slice_offset(self):
         import sympy
@@ -2603,6 +2793,32 @@ class TestDrainMaterialization(unittest.TestCase):
 
 
 class TestTryProveForEachTile(unittest.TestCase):
+    def test_host_counter_stays_integer_under_spyre_comparison_lowering(self):
+        from torch._inductor import ir
+        from torch._inductor.graph import GraphLowering
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from torch.fx.experimental.proxy_tensor import make_fx
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        from torch_spyre._inductor.lowering import enable_spyre_lowerings
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import _extract_trip_count
+
+        with FakeTensorMode(shape_env=ShapeEnv()) as fake_mode:
+            counter = torch.empty((), dtype=torch.int64, device="cpu")
+            gm = make_fx(lambda i: (i < 16,))(counter)
+            graph = GraphLowering(
+                gm, example_inputs=[counter], shape_env=fake_mode.shape_env
+            )
+            with (
+                V.set_graph_handler(graph),
+                V.set_fake_mode(fake_mode),
+                enable_spyre_lowerings(),
+            ):
+                graph.run(counter)
+                self.assertEqual(_extract_trip_count(graph), 16)
+                self.assertEqual(len(graph.operations), 1)
+                self.assertIsInstance(graph.operations[0], ir.ComputedBuffer)
+
     def test_map_mode_accepted_with_trip_count(self):
         (X, Y), _ref = matmul_inputs()
         while_op = _find_while_loop_ir_op(split_m_fn, (X, Y))
@@ -2778,6 +2994,108 @@ class TestConsumeTileDimMarkers(unittest.TestCase):
         with V.set_graph_handler(graph), V.set_fake_mode(fake_mode):
             graph.run(*placeholders)
         return graph
+
+    def test_scatter_indexer_preserves_marker_advance_and_read_redirection(self):
+        from for_each_tile_fixtures import scatter_carry_fn
+        from torch._inductor import config, ir
+        from torch._inductor.dependencies import MemoryDep
+
+        from torch_spyre._inductor.pass_utils import (
+            _scatter_index_buf_names_ordered,
+            redirect_computed_buffer_reads,
+        )
+        from torch_spyre._inductor.wsr.for_each_tile_lowering import (
+            _body_loop_var,
+            _consume_tile_dim_markers,
+            _stacking_carry_indices,
+        )
+        from torch_spyre._inductor.wsr.while_loop_bridge import (
+            carry_bindings_for,
+            splice_while_loop,
+        )
+
+        args = (
+            torch.randn(4, 32, 64),
+            torch.arange(128).reshape(4, 32),
+            torch.full((192, 64), 3.0),
+        )
+        with (
+            mock.patch("torch.accelerator.is_available", return_value=False),
+            config.patch("force_disable_caches", True),
+        ):
+            graph = self._run_graph(scatter_carry_fn, args)
+
+        while_op = next(op for op in graph.operations if isinstance(op, ir.WhileLoop))
+        proof = try_prove_for_each_tile(while_op)
+        self.assertTrue(proof.accepted)
+        loop_var = _body_loop_var(while_op)
+        with V.set_graph_handler(graph):
+            carries = carry_bindings_for(
+                while_op, _stacking_carry_indices(while_op, loop_var)
+            )
+            group = splice_while_loop(
+                graph, while_op, carries, trip_count=proof.trip_count
+            )
+            scatter = next(
+                op
+                for op in group
+                if isinstance(op, ir.ComputedBuffer) and isinstance(op.data, ir.Scatter)
+            )
+            destination = scatter.layout.get_buffer()
+            self.assertEqual(destination.get_name(), graph.graph_outputs[0].get_name())
+            self.assertNotIn(destination, group)
+            self.assertFalse(
+                any(
+                    isinstance(op, ir.ComputedBuffer)
+                    and not isinstance(op.data, ir.Scatter)
+                    and list(op.data.ranges) == [192, 64]
+                    for op in group
+                ),
+                "the output carry must not copy all rows on every trip",
+            )
+            for dep in scatter.get_read_writes().reads:
+                if isinstance(dep, MemoryDep):
+                    self.assertNotIsInstance(
+                        graph.get_buffer(dep.name).get_layout(),
+                        ir.MutationLayoutSHOULDREMOVE,
+                    )
+            (marker_name,) = _scatter_index_buf_names_ordered(scatter)
+            marker = graph.name_to_buffer[marker_name]
+            self.assertEqual(marker.tile_marker_dim, 0)
+            (upstream,) = [
+                dep
+                for dep in marker.get_read_writes().reads
+                if isinstance(dep, MemoryDep)
+            ]
+            self.assertEqual(upstream.index.coeff(loop_var), 32)
+
+            _consume_tile_dim_markers(group, graph.operations)
+            scatter = graph.name_to_buffer[scatter.get_name()]
+            self.assertEqual(_scatter_index_buf_names_ordered(scatter), [upstream.name])
+            (index_read,) = [
+                dep
+                for dep in scatter.get_read_writes().reads
+                if isinstance(dep, MemoryDep) and dep.name == upstream.name
+            ]
+            self.assertEqual(index_read.index.coeff(loop_var), 32)
+            self.assertNotIn(marker_name, {op.get_name() for op in group})
+
+            # Read renames must also reach the separate destination indexer.
+            renamed = "renamed_scatter_indices"
+            graph.name_to_buffer[renamed] = graph.get_buffer(upstream.name)
+            scatter = redirect_computed_buffer_reads(
+                scatter, {upstream.name: renamed}, graph.operations, pass_name="test"
+            )
+            self.assertEqual(_scatter_index_buf_names_ordered(scatter), [renamed])
+            (index_read,) = [
+                dep
+                for dep in scatter.get_read_writes().reads
+                if isinstance(dep, MemoryDep) and dep.name == renamed
+            ]
+            self.assertEqual(index_read.index.coeff(loop_var), 32)
+            self.assertNotIn(
+                upstream.name, {d.name for d in scatter.get_read_writes().reads}
+            )
 
     def test_marker_erased_and_mapped_after_split_m_splice(self):
         """Marker resolution for split_m_fn's StarDep-shaped matmul consumer.
