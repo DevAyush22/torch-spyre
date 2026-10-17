@@ -137,11 +137,8 @@ class TestExhaustiveSearchResidency(TestCase):
             residency_reason="no consumer reads it from LX",
         )
 
-        solver = ExhaustiveSearchSolver(
-            [producer, consumer, sink],
-            size=512,
-            inner_factory=GreedyLayoutSolver,
-            alignment=1,
+        solver = ExhaustiveSearchSolver.wrapping(GreedyLayoutSolver)(
+            [producer, consumer, sink], size=512, alignment=1
         )
         result = {
             buffer.name: buffer for buffer in solver.plan_layout_and_core_divisions()
@@ -1759,6 +1756,23 @@ class TestSympyExprToCpSatPrinter(TestCase):
         self.assertEqual(solver.ObjectiveValue(), 20)
         self.assertEqual(solver.Value(sym_map["x"]), 10)
 
+    def test_quarter_power_matches_float_and_rational_exponent(self):
+        # split**0.25 and split**Rational(1, 4) get the same x^(1/4)
+        # approximation, within its documented 4.5% on [1, 32]; a symbolic
+        # exponent is left alone.
+        printer = _SympyExprToCpSat(cp_model.CpModel(), {}, {})
+        split = sympy.Symbol("split_x", integer=True, positive=True)
+        for exp in (0.25, sympy.Rational(1, 4)):
+            with self.subTest(exp=exp):
+                approx = printer._inv_log_sym(split**exp)
+                self.assertIsInstance(approx, sympy.Piecewise)
+                for v in (1, 2, 5, 8, 16, 32):
+                    self.assertAlmostEqual(
+                        float(approx.subs(split, v)), v**0.25, delta=0.045 * v**0.25
+                    )
+        n = sympy.Symbol("n")
+        self.assertEqual(printer._inv_log_sym(split**n), split**n)
+
     def test_negated_and_unnamed_boolean_products_preserve_every_assignment(self):
         model = cp_model.CpModel()
         a, b = [model.new_bool_var("") for _ in range(2)]
@@ -1879,7 +1893,13 @@ class TestSympyExprToCpSatPrinter(TestCase):
         x, y, z, resident = sympy.symbols(
             "split_x split_y split_z resident", integer=True
         )
+        # This cost is zero for every division candidate. Multiplying the
+        # table-folded zero by residency produces a CP-SAT LinearExpr constant;
+        # Min/Max must still accept it and preserve the runtime-cost objective.
+        zero_cost = sympy.Piecewise((0, x <= 8), (x, True)) * (1 - resident)
         expressions = [
+            sympy.Min(z - 2, zero_cost),
+            sympy.Max(z - 2, zero_cost),
             1e-6 * x**2 * y + sympy.Min(0.125 * x * y, 3.25),
             1000 * y / x + 0.25 * sympy.log(x, 2),
             x * y * z * (1 - resident),
@@ -2766,6 +2786,37 @@ class TestInvScale(TestCase):
         self.assertEqual([v for v in raw if scale % v], [7])
         self.assertEqual([v for v in raw if 864 % v], [7])
         self.assertEqual(self._max_error(raw, 864), self._max_error(raw, 288))
+
+    def test_tile_counts_past_the_core_count_keep_every_reciprocal(self):
+        # A tile count is any divisor of its axis, so it can pass the core
+        # count a _CORE_INV_SCALE-sized cap was sized for. 2048 used to trip
+        # the power-of-two assert; 1536 alone used to floor 1024 // v to 0.
+        for label, raw in {
+            "exact power of two": [1, 2048],
+            "power of two with a coprime": [1, 2048, 3, 7],
+            "no power of two past 1": [1, 1536],
+        }.items():
+            with self.subTest(label):
+                scale = self._scale(raw)
+                self.assertGreaterEqual(min(scale // v for v in raw), 1)
+                self.assertFalse([v for v in raw if not v & (v - 1) and scale % v])
+                self.assertLessEqual(self._max_error(raw, scale), self.MAX_ERROR)
+
+
+class TestObjectiveCostParams(TestCase):
+    """Every solver's objective drops the tile-height derates."""
+
+    def test_the_objective_neutralizes_the_derates(self):
+        from torch_spyre._inductor.cost_model import CostParams, coarse_underfill_eff
+        from torch_spyre._inductor.scratchpad.allocator import _COST_PARAMS
+
+        # A symbolic tile height leaves no fractional power behind.
+        is_lx, split = sympy.symbols("is_lx_buf0 split_buf0_d0", positive=True)
+        rpc = (256 * (1 - is_lx) + 1024 * is_lx) / split
+        eff = sympy.sympify(coarse_underfill_eff(rpc, 512, _COST_PARAMS))
+        self.assertFalse(eff.free_symbols)
+        self.assertEqual(float(eff), 1.0)
+        self.assertLess(coarse_underfill_eff(2.0, 512, CostParams()), 1)
 
 
 if __name__ == "__main__":
