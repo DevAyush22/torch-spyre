@@ -271,6 +271,8 @@ CUMSUM_PARAM_SETS = {
         0,
         torch.tensor([1.0, 2.0, 3.0, 4.0, -1.0, 0.5, -0.5, 1.5], dtype=torch.float16),
     ),
+    # 0-D: no dim to scan, so CPU fallback
+    "0d": (0, cached_randn(())),
     # 2-D
     "2d_dim_0": (0, cached_randn((67, 256))),
     "2d_dim_0_n1": (0, cached_randn((1, 256))),  # n=1 edge case: identity cumsum
@@ -312,6 +314,16 @@ CUMSUM_PARAM_SETS = {
     "pad_5d_dim_2": (2, cached_randn((2, 3, 7, 4, 128))),
     "pad_5d_dim_neg1": (-1, cached_randn((2, 3, 4, 5, 129))),
     # -----------------------------------------------------------------------
+    # bf16 (same device format as fp16, so the same BMM path)
+    "1d_256_bf16": (0, cached_randn((256,), dtype=torch.bfloat16)),
+    "2d_dim_0_bf16": (0, cached_randn((67, 256), dtype=torch.bfloat16)),
+    "2d_dim_1_b2_bf16": (1, cached_randn((2, 256), dtype=torch.bfloat16)),
+    "3d_dim_1_bf16": (1, cached_randn((4, 67, 256), dtype=torch.bfloat16)),
+    "4d_dim_neg1_bf16": (-1, cached_randn((1, 48, 1, 256), dtype=torch.bfloat16)),
+    # bf16, n not a stick multiple
+    "pad_2d_dim_1_bf16": (1, cached_randn((63, 129), dtype=torch.bfloat16)),
+    "pad_3d_dim_2_bf16": (2, cached_randn((3, 7, 9), dtype=torch.bfloat16)),
+    # -----------------------------------------------------------------------
     # fp32
     # 2-D
     "2d_dim_0_fp32": (0, cached_randn((67, 256), dtype=torch.float32)),
@@ -341,7 +353,7 @@ CUMSUM_PARAM_SETS = {
     "pad_3d_dim_1_fp32": (1, cached_randn((3, 7, 17), dtype=torch.float32)),
     "pad_3d_dim_2_fp32": (2, cached_randn((3, 7, 17), dtype=torch.float32)),
     # -----------------------------------------------------------------------
-    # int32
+    # int32 (torch.cumsum returns int64, so these fall back to CPU)
     "2d_dim_0_int32": (0, cached_randint((9, 64))),
     "2d_dim_1_int32": (1, cached_randint((4, 64))),
     "2d_dim_neg1_int32": (-1, cached_randint((4, 32))),
@@ -355,6 +367,35 @@ CUMSUM_PARAM_SETS = {
     "pad_2d_dim_1_int32": (1, cached_randint((4, 17))),
     "pad_3d_dim_1_int32": (1, cached_randint((3, 7, 17))),
     "pad_3d_dim_2_int32": (2, cached_randint((3, 7, 17))),
+    # -----------------------------------------------------------------------
+    # int64 (stored as IEEE_INT32 on Spyre; prefix scan uses addi32toi32)
+    "2d_dim_0_int64": (0, cached_randint((9, 64), dtype=torch.int64)),
+    "2d_dim_1_int64": (1, cached_randint((4, 64), dtype=torch.int64)),
+    "2d_dim_neg1_int64": (-1, cached_randint((4, 32), dtype=torch.int64)),
+    "3d_dim_0_int64": (0, cached_randint((4, 3, 32), dtype=torch.int64)),
+    "3d_dim_1_int64": (1, cached_randint((4, 9, 32), dtype=torch.int64)),
+    "3d_dim_2_int64": (2, cached_randint((4, 3, 32), dtype=torch.int64)),
+    "4d_dim_1_int64": (1, cached_randint((2, 9, 3, 32), dtype=torch.int64)),
+    "4d_dim_3_int64": (3, cached_randint((2, 3, 4, 32), dtype=torch.int64)),
+    # int64, n not a stick multiple
+    "pad_2d_dim_0_int64": (0, cached_randint((9, 17), dtype=torch.int64)),
+    "pad_2d_dim_1_int64": (1, cached_randint((4, 17), dtype=torch.int64)),
+    "pad_3d_dim_1_int64": (1, cached_randint((3, 7, 17), dtype=torch.int64)),
+    "pad_3d_dim_2_int64": (2, cached_randint((3, 7, 17), dtype=torch.int64)),
+    "1d_17_int64": (0, cached_randint((17,), dtype=torch.int64)),
+    "2d_dim_0_neg_int64": (
+        0,
+        cached_randint((9, 64), low=-512, high=512, dtype=torch.int64),
+    ),
+    # Partial sums pass 2**24, which fp32 cannot hold exactly, and stay < 2**31.
+    "2d_dim_1_big_int64": (
+        1,
+        cached_randint((4, 128), low=2**22, high=2**23, dtype=torch.int64),
+    ),
+    # -----------------------------------------------------------------------
+    # bool (torch.cumsum returns int64, so these fall back to CPU)
+    "2d_dim_1_bool": (1, cached_randint((4, 64), high=2) > 0),
+    "3d_dim_0_bool": (0, cached_randint((4, 3, 32), high=2) > 0),
     # -----------------------------------------------------------------------
     # Multiple seeds: validates fp16 precision at natural scale (1.0).
     "2d_dim_1_b2_seed1": (1, cached_randn((2, 256), differentiation=1)),
@@ -8061,6 +8102,46 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ("test_cumsum", "test_cumsum_cpu"): {
             "param_sets": CUMSUM_PARAM_SETS,
         },
+        # torch.cumsum(..., dtype=...). The last value says whether it runs on
+        # Spyre (same dtype, or a native same-width conversion) or on CPU.
+        ("test_cumsum_dtype", "test_cumsum_dtype_cpu"): {
+            "param_sets": {
+                "2d_int32_to_int32": (1, torch.int32, cached_randint((4, 64)), True),
+                "2d_dim_0_int64_to_fp32": (
+                    0,
+                    torch.float32,
+                    cached_randint((9, 64), dtype=torch.int64),
+                    True,
+                ),
+                # Halves in [-8, 8): the conversion truncates toward zero.
+                "2d_dim_0_fp32_to_int64": (
+                    0,
+                    torch.int64,
+                    cached_randint((9, 64), low=-16, high=16).to(torch.float32) / 2,
+                    True,
+                ),
+                "2d_dim_0_fp16_to_bf16": (
+                    0,
+                    torch.bfloat16,
+                    cached_randint((9, 64), high=8).to(torch.float16),
+                    True,
+                ),
+                # No int64 -> int32 conversion op: CPU fallback.
+                "1d_int64_to_int32": (
+                    0,
+                    torch.int32,
+                    cached_randint((8,), dtype=torch.int64),
+                    False,
+                ),
+                # 16 -> 32 bit conversion: CPU fallback.
+                "2d_dim_0_fp16_to_fp32": (
+                    0,
+                    torch.float32,
+                    cached_randint((9, 64), high=8).to(torch.float16),
+                    False,
+                ),
+            },
+        },
         # torch.any / torch.all: single-dim reduction
         ("test_any_single_dim", "test_reduce_keepdim0_cpu"): {
             "ops_dict": {"any": torch.any},
@@ -9120,7 +9201,42 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         _compare_op_with_cpu(lambda x: op(x, ord=ord, dim=dim, keepdim=True), op, x)
 
     def test_cumsum_cpu(self, dim: int, x):
-        self.compare_with_cpu(lambda t: torch.cumsum(t, dim=dim), x, run_eager=False)
+        # Integer cumsum is exact; float inputs keep the default tolerance.
+        tol = {} if x.dtype.is_floating_point else {"atol": 0, "rtol": 0}
+        self.compare_with_cpu(
+            lambda t: torch.cumsum(t, dim=dim), x, run_eager=False, **tol
+        )
+
+    def test_cumsum_dtype_cpu(self, dim: int, dtype: torch.dtype, x, on_device: bool):
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            self.compare_with_cpu(
+                lambda t: torch.cumsum(t, dim=dim, dtype=dtype),
+                x,
+                atol=0,
+                rtol=0,
+                run_eager=False,
+            )
+        fell_back = any(
+            "cumsum_cpu_fallback" in str(w.message)
+            for w in captured
+            if issubclass(w.category, FallbackWarning)
+        )
+        assert fell_back != on_device, f"on_device={on_device}, fell_back={fell_back}"
+
+    def test_cumsum_int64_on_device(self):
+        # The value tests would also pass via the CPU fallback; check that
+        # int64 runs on Spyre.
+        x = cached_randint((4, 64), dtype=torch.int64)
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            self.compare_with_cpu(
+                lambda t: torch.cumsum(t, dim=1), x, atol=0, rtol=0, run_eager=False
+            )
+        fallbacks = [
+            str(w.message) for w in captured if issubclass(w.category, FallbackWarning)
+        ]
+        assert not any("cumsum_cpu_fallback" in m for m in fallbacks), fallbacks
 
     def _get_core_reduction_invalid_dim_cases(self):
         x = cached_randn((3, 5, 64))

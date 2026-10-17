@@ -35,6 +35,7 @@ import torch._decomp as decomp
 from torch._prims_common import ELEMENTWISE_TYPE_PROMOTION_KIND, elementwise_dtypes
 
 from .constants import DEVICE_NAME, FP8_E4M3FN_MAX, FP8_E4M3FN_MIN
+from .dtype_ops import DtypeOpTable
 from .errors import Unsupported
 from .sliding_window_plan import (
     MAX_QUERY_BLOCK,
@@ -3062,18 +3063,29 @@ def bitwise_and(input1: torch.Tensor, input2: torch.Tensor) -> torch.Tensor:
 
 # Spyre has no native scan op (issue #3388), so cumsum is decomposed as:
 #
-#   int32 / bool: integer add not supported on Spyre; CPU fallback, does not
+#   Inputs that need a width-changing or unsupported dtype conversion (e.g.
+#   bool and int32, which accumulate in int64) fall back to CPU and do not
 #   reach the steps below.
 #
-#   For fp16 and fp32:
 #   1. reshape_and_pad_via_cpu  — reshape to (A, n, B) and zero-pad to
-#      (A_scan, n_scan, B_scan) on CPU (avoids issue #3916).
+#      (A_scan, n_scan, B_scan) on CPU (avoids issue #3916), then convert to
+#      the result dtype.
 #   2. On-device scan:
-#      - fp16: tril(ones(n_scan, n_scan)) @ y_3d via BMM.
+#      - fp16 / bf16: tril(ones(n_scan, n_scan)) @ y_3d via BMM.
 #              A_scan = max(A, _CUMSUM_MIN_B) to meet the BMM batch requirement.
-#      - fp32: parallel prefix scan on dim=1 of (A_scan, n_scan, B_scan).
+#      - fp32 / int32 / int64: parallel prefix scan on dim=1 of
+#        (A_scan, n_scan, B_scan).
 #   3. slice_and_reshape_via_cpu  — remove padding and restore original shape on CPU.
 #   TODO: steps 1 and 3 can be replaced with inline ops once #3916 is fixed.
+
+# Result dtypes with an on-device scan.
+_CUMSUM_SCAN_DTYPES = (
+    torch.float16,
+    torch.bfloat16,
+    torch.float32,
+    torch.int32,
+    torch.int64,
+)
 
 # Minimum batch-dim size required by the Spyre bmm kernel.
 _CUMSUM_MIN_B = 4
@@ -3085,34 +3097,46 @@ def spyre_cumsum(
     dim: int,
     dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
-    y = x if dtype is None else x.to(dtype)
-    if y.dtype not in (torch.float16, torch.float32):
-        # integer add not supported on Spyre; fall back to CPU.
-        return torch.ops.spyre.cumsum_cpu_fallback(y, dim % y.dim())
+    if dtype is None:
+        # torch.cumsum accumulates bool and integer inputs in int64.
+        dtype = x.dtype if x.dtype.is_floating_point else torch.int64
+    # A conversion runs on Spyre only if it is native and keeps the element width.
+    on_device = dtype in _CUMSUM_SCAN_DTYPES and (
+        x.dtype == dtype
+        or (
+            DtypeOpTable.is_supported(x.dtype, dtype)
+            and get_elem_in_stick(x.dtype) == get_elem_in_stick(dtype)
+        )
+    )
+    # A 0-d input has no dim to scan.
+    if not on_device or x.dim() == 0:
+        return torch.ops.spyre.cumsum_cpu_fallback(x, dim, dtype)
 
-    ndim = y.dim()
+    ndim = x.dim()
     dim = dim % ndim  # normalise negative dim
-    n = y.shape[dim]
-    _STICK = get_elem_in_stick(y.dtype)
+    n = x.shape[dim]
+    _STICK = get_elem_in_stick(dtype)
 
-    A = math.prod(list(y.shape[:dim]))  # dims before scan
-    B = math.prod(list(y.shape[dim + 1 :]))  # dims after scan
+    A = math.prod(list(x.shape[:dim]))  # dims before scan
+    B = math.prod(list(x.shape[dim + 1 :]))  # dims after scan
 
     n_scan = math.ceil(n / _STICK) * _STICK
     B_scan = max(_STICK, math.ceil(B / _STICK) * _STICK)  # at least one stick wide
 
-    A_scan = max(A, _CUMSUM_MIN_B) if y.dtype == torch.float16 else A
+    use_bmm = dtype in (torch.float16, torch.bfloat16)
+    A_scan = max(A, _CUMSUM_MIN_B) if use_bmm else A
 
     y_3d = torch.ops.spyre.reshape_and_pad_via_cpu(
-        y, (A, n, B), (A_scan, n_scan, B_scan)
-    )
+        x, (A, n, B), (A_scan, n_scan, B_scan)
+    ).to(dtype)
 
-    if y.dtype == torch.float16:
-        L = torch.tril(torch.ones(n_scan, n_scan, dtype=y.dtype, device=y.device))
+    if use_bmm:
+        L = torch.tril(torch.ones(n_scan, n_scan, dtype=dtype, device=x.device))
         L_b = L.unsqueeze(0).expand(A_scan, -1, -1).clone()  # clone for a dense buffer
         result = torch.ops.aten.bmm.default(L_b, y_3d)
     else:
-        # fp32: prefix scan — each step adds a shifted copy of the running sum.
+        # fp32 / int32 / int64: prefix scan — each step adds a shifted copy of
+        # the running sum.
         result = y_3d
         offset = 1
         while offset < n_scan:
@@ -3122,7 +3146,7 @@ def spyre_cumsum(
             result = result + shifted
             offset *= 2
 
-    return torch.ops.spyre.slice_and_reshape_via_cpu(result, (A, n, B), list(y.shape))
+    return torch.ops.spyre.slice_and_reshape_via_cpu(result, (A, n, B), list(x.shape))
 
 
 #: Largest kernel tap (per spatial axis) the direct conv2d path accepts. A

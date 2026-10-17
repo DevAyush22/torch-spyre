@@ -708,17 +708,17 @@ def _(
 @torch.library.custom_op(
     "spyre::cumsum_cpu_fallback", mutates_args=(), device_types="spyre"
 )
-def spyre_cumsum_cpu_fallback(input: torch.Tensor, dim: int) -> torch.Tensor:
-    """CPU fallback for torch.cumsum on dtypes not supported on Spyre."""
+def spyre_cumsum_cpu_fallback(
+    input: torch.Tensor, dim: int, dtype: torch.dtype
+) -> torch.Tensor:
+    """torch.cumsum on CPU, for the cases spyre_cumsum does not run on Spyre."""
     warn_fallback("torch.ops.spyre.cumsum_cpu_fallback")
-    return torch.cumsum(input.to("cpu"), dim=dim).to(input.device)
+    return torch.cumsum(input.to("cpu"), dim=dim, dtype=dtype).to(input.device)
 
 
 @spyre_cumsum_cpu_fallback.register_fake
-def _(input: torch.Tensor, dim: int) -> torch.Tensor:
-    # torch.cumsum promotes bool/int32 to int64; match the real output dtype.
-    out_dtype = torch.int64 if input.dtype in (torch.bool, torch.int32) else input.dtype
-    return input.new_empty(input.shape, dtype=out_dtype)
+def _(input: torch.Tensor, dim: int, dtype: torch.dtype) -> torch.Tensor:
+    return input.new_empty(input.shape, dtype=dtype)
 
 
 @torch.library.custom_op("spyre::min_dim_int64_fallback", mutates_args=())
