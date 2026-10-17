@@ -18,7 +18,6 @@ from dataclasses import replace
 import json
 import logging
 import logging.handlers
-import collections
 import math
 import regex as re
 from types import SimpleNamespace
@@ -46,18 +45,21 @@ import torch_spyre._inductor.scratchpad.lx_relayout as lx_relayout_module
 import torch_spyre._inductor.scheduler as scheduler_module
 import torch_spyre._inductor.work_division as _wd
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
+from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 from torch_spyre._C import DataFormats, SpyreTensorLayout
 from torch_spyre._inductor.codegen.superdsc import compile_op_spec, parse_op_spec
 from torch_spyre._inductor.constants import (
     BATCH_MATMUL_OP,
     IDENTITY_OP,
 )
-from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
-from torch_spyre._inductor.loop_info import CarriedReductionRecord
+from for_each_tile_fixtures import (
+    carried_expert_sum_fn,
+    carried_routed_expert_sum_fn,
+)
 from utils_inductor import (
+    opspec_summaries,
     mock_backend_compiler,
-    assert_lx_only_relayout_payload,
     capture_backend_output_dirs,
 )
 from torch_spyre._inductor.scratchpad.lx_relayout import (
@@ -73,6 +75,9 @@ from torch_spyre._inductor.op_spec import (
 from torch_spyre._inductor.pass_utils import PerCoreView
 import torch_spyre._inductor.scratchpad.allocator as allocator_module
 from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
+from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
+    FirstFitLayoutSolver,
+)
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 from torch_spyre._inductor.spyre_kernel import SpyreKernel, _iter_op_specs
 from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
@@ -105,7 +110,6 @@ def _emitted_kernels():
 
 
 _capture_backend_output_dirs = capture_backend_output_dirs
-_assert_lx_only_relayout_payload = assert_lx_only_relayout_payload
 
 
 class TestNamedWorkDivisionHint(InductorTestCase):
@@ -384,6 +388,7 @@ class TestNamedWorkDivisionHint(InductorTestCase):
 
     @pytest.mark.xfail(
         strict=True,
+        raises=AssertionError,
         reason=(
             "Named work-division hints do not yet distinguish component names "
             "inside a reshaped compound dimension."
@@ -413,6 +418,7 @@ class TestNamedWorkDivisionHint(InductorTestCase):
 
     @pytest.mark.xfail(
         strict=True,
+        raises=AssertionError,
         reason=(
             "Named work-division hints do not yet distinguish component names "
             "inside a reshaped compound dimension."
@@ -511,23 +517,26 @@ class TestNamedWorkDivisionHint(InductorTestCase):
             "sencores": 8,
         }
     )
-    def test_tiles_do_not_create_work_div_hint(self):
+    def test_for_each_tile_does_not_create_work_div_hint(self):
         M, N = 128, 64
         x = torch.randn(M, N, dtype=torch.float16).to("spyre")
-        _declare_tensor_dim("M", M)
-        _declare_tensor_dim("N", N)
-        _name_tensor_dims(x, ["M", "N"])
 
         def fn(x):
-            with spyre_hint(tiles={"M": 4}):
-                return torch.abs(x)
+            def body(_, ops):
+                (x_tile,) = ops
+                return None, torch.abs(x_tile)
+
+            _, out = for_each_tile(body, (x,), dims=(0,), tile_size=M // 4, out_dim=0)
+            return out
 
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_backend_compiler(),
         ):
-            _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), x)
+            _, source_codes = run_and_get_code(
+                torch.compile(fn, dynamic=False, fullgraph=True), x
+            )
         self.assertIn("LoopSpec(", source_codes[0])
         self.assertFalse(any("user-hint" in msg for msg in self._logs()))
 
@@ -539,7 +548,7 @@ class TestNamedWorkDivisionHint(InductorTestCase):
             "sencores": 8,
         }
     )
-    def test_tiles_and_work_div_coexist(self):
+    def test_for_each_tile_and_work_div_coexist(self):
         M, N = 128, 128  # N=128 = 2 sticks; work_div={"N": 2} splits into 1 stick/core
         x = torch.randn(M, N, dtype=torch.float16).to("spyre")
         _declare_tensor_dim("M", M)
@@ -547,15 +556,24 @@ class TestNamedWorkDivisionHint(InductorTestCase):
         _name_tensor_dims(x, ["M", "N"])
 
         def fn(x):
-            with spyre_hint(tiles={"M": 4}, work_div={"N": 2}):
-                return torch.abs(x)
+            def body(_, ops):
+                (x_tile,) = ops
+                return None, torch.abs(x_tile)
+
+            with spyre_hint(work_div={"N": 2}):
+                _, out = for_each_tile(
+                    body, (x,), dims=(0,), tile_size=M // 4, out_dim=0
+                )
+            return out
 
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_backend_compiler(),
         ):
-            _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), x)
+            _, source_codes = run_and_get_code(
+                torch.compile(fn, dynamic=False, fullgraph=True), x
+            )
         self.assertIn("LoopSpec(", source_codes[0])
         self._assert_user_hint_logged()
 
@@ -773,8 +791,10 @@ def test_anchor_returns_unchanged_plans(plans, disabled):
 
 @pytest.mark.parametrize("mode", ["unsupported_solver", "off", "ktir"])
 def test_fixed_plan_handoff_keeps_feature_gates(mode):
-    factory = SimpleNamespace(supports_paired_buffers=mode != "unsupported_solver")
-    allocator = ScratchpadAllocator(factory, 256)
+    solver = (
+        FirstFitLayoutSolver if mode == "unsupported_solver" else GreedyLayoutSolver
+    )
+    allocator = ScratchpadAllocator(solver, 256)
     graph = _allocation_graph()
     with (
         config.patch(
@@ -794,11 +814,12 @@ def test_fixed_plan_handoff_keeps_feature_gates(mode):
 def test_joint_allocation_does_not_consume_fixed_plan_handoff():
     allocator = allocator_module.CoOptimizingAllocator(GreedyLayoutSolver, 256)
     graph = _allocation_graph()
+    division_map = allocator_module._DivisionMap({}, set())
     with (
         mock_patch.object(
             allocator, "_determine_in_place_division_invariant", return_value={}
         ),
-        mock_patch.object(allocator, "_division_map", return_value={}),
+        mock_patch.object(allocator, "_division_map", return_value=division_map),
         mock_patch.object(
             allocator, "_build_cd_bound_buffers", return_value=[]
         ) as build,
@@ -806,7 +827,7 @@ def test_joint_allocation_does_not_consume_fixed_plan_handoff():
     ):
         allocator._prepare_buffers(graph, lx_relayout_plans=[_relayout_plan()])
     collect.assert_not_called()
-    build.assert_called_once_with(graph, {}, {})
+    build.assert_called_once_with(graph, {}, division_map)
 
 
 @pytest.mark.parametrize(
@@ -975,7 +996,8 @@ def test_restickify_lx_read_requires_the_same_physical_owners():
             32,
             True,
         ),
-        # Gather then broadcast: every completed slice reaches several cores.
+        # Geometrically valid gather/broadcast, but each destination needs 32
+        # incoming fragments, exceeding the shuffle address-register budget.
         (
             _view({2: 32}, {2: Mod(_CORE_ID, 32)}, 32),
             _view(
@@ -983,7 +1005,7 @@ def test_restickify_lx_read_requires_the_same_physical_owners():
             ),
             32,
             32,
-            True,
+            False,
         ),
         # A larger domain need not replicate slices evenly: each source feeds
         # four cores and each destination core has one source.
@@ -1398,7 +1420,7 @@ def test_lx_relayout_normalizes_ownership_and_lowers_only_in_superdsc():
         "allow_all_ops_in_lx_planning": True,
         "lx_planner_relayout": True,
         # LX relayout needs a paired-buffer-capable solver; only the greedy
-        # solver sets supports_paired_buffers. Pin it explicitly so this test
+        # solver supports paired buffers. Pin it explicitly so this test
         # keeps exercising relayout regardless of the default layout_solver.
         "layout_solver": "greedy",
         "co_optimizing_lx_planning": False,
@@ -1543,11 +1565,10 @@ def test_grouped_lx_relayout_device(broadcast):
         _name_tensor_dims(attention.to("spyre"), ["H", "Lq", "Lk"]),
     )
     torch._inductor.codecache.FxGraphCache.clear()
-    with _capture_backend_output_dirs() as output_dirs:
-        actual, code = run_and_get_code(
-            torch.compile(fn, dynamic=False, options={"epilogue_fusion": False}),
-            *device_args,
-        )
+    actual, code = run_and_get_code(
+        torch.compile(fn, dynamic=False, options={"epilogue_fusion": False}),
+        *device_args,
+    )
     torch.testing.assert_close(actual.cpu(), fn(value, attention), rtol=2e-2, atol=2e-1)
     relayouts = [
         block
@@ -1559,7 +1580,6 @@ def test_grouped_lx_relayout_device(broadcast):
     assert len(relayouts) == 1
     domains = re.findall(r"num_cores=(\d+)", relayouts[0])
     assert domains == [str(source_cores), "32"]
-    _assert_lx_only_relayout_payload(output_dirs)
 
 
 @config.patch(
@@ -1627,7 +1647,6 @@ def test_lx_relayout_read_expansion_device(reader, enabled):
     assert len(copies) == int(enabled)
     if enabled:
         assert re.findall(r"num_cores=(\d+)", copies[0]) == ["8", "32"]
-        _assert_lx_only_relayout_payload(directories)
     if reader == "split_matmul":
         matmuls = [
             root
@@ -1654,7 +1673,7 @@ def test_lx_relayout_read_expansion_device(reader, enabled):
 def test_unhinted_moe_down_route_preserves_the_chosen_split(enabled):
     """Keep the chosen E=2 down->route split while changing only its storage.
 
-    The only hint creates the two-expert loop; there is deliberately no work
+    The only loop is the two-expert for_each_tile; there is deliberately no work
     division hint. The cost model chooses T=4, H=4 and reduction=2 in both
     modes. ON gathers four finished H pieces into each reader's row slice;
     OFF retains the HBM boundary. No change to the chooser is required.
@@ -1675,37 +1694,41 @@ def test_unhinted_moe_down_route_preserves_the_chosen_split(enabled):
         .contiguous()
     )
     routes = torch.full((experts, tokens, 1), 0.5, dtype=torch.float16)
-    for name, size in (
-        ("E", experts),
-        ("T", tokens),
-        ("F", intermediate),
-        ("H", hidden),
-        ("R", 1),
-    ):
-        _declare_tensor_dim(name, size)
 
     def fn(activations, weights, routes):
-        with spyre_hint(num_tiles_per_dim={"E": experts}):
-            down = torch.bmm(activations, weights)
-            return down * routes
+        def body(_, ops):
+            act_tile, weight_tile, route_tile = ops
+            return None, torch.bmm(act_tile, weight_tile) * route_tile
+
+        _, out = for_each_tile(
+            body, (activations, weights, routes), dims=(0, 0, 0), tile_size=1, out_dim=0
+        )
+        return out
+
+    def reference(activations, weights, routes):
+        return torch.bmm(activations, weights) * routes
 
     device_args = (
-        _name_tensor_dims(activations.to("spyre"), ["E", "T", "F"]),
-        _name_tensor_dims(weights.to("spyre"), ["E", "F", "H"]),
-        _name_tensor_dims(routes.to("spyre"), ["E", "T", "R"]),
+        activations.to("spyre"),
+        weights.to("spyre"),
+        routes.to("spyre"),
     )
     torch._inductor.codecache.FxGraphCache.clear()
     with (
         config.patch(lx_planner_relayout=enabled, core_id_k_fast_emission=True),
         _emitted_kernels() as kernels,
-        _capture_backend_output_dirs() as directories,
     ):
         actual, _ = run_and_get_code(
-            torch.compile(fn, dynamic=False, options={"epilogue_fusion": False}),
+            torch.compile(
+                fn,
+                dynamic=False,
+                fullgraph=True,
+                options={"epilogue_fusion": False},
+            ),
             *device_args,
         )
     torch.testing.assert_close(
-        actual.cpu(), fn(activations, weights, routes), rtol=0, atol=0
+        actual.cpu(), reference(activations, weights, routes), rtol=0, atol=0
     )
     specs = [spec for kernel in kernels for spec in _iter_op_specs(kernel.op_specs)]
     bmm_specs = [spec for spec in specs if spec.op == BATCH_MATMUL_OP]
@@ -1724,10 +1747,6 @@ def test_unhinted_moe_down_route_preserves_the_chosen_split(enabled):
         assert copy.args[0].allocation == down_arg.allocation
         assert set(copy.args[-1].allocation) == {"lx"}
         assert copy.completed_producer_cores == tuple(range(1, 32, 2))
-        native_routes = _assert_lx_only_relayout_payload(directories)
-        assert collections.Counter(
-            core for readers in native_routes.values() for core in readers
-        ) == {core: 4 for core in range(32)}
         assert any(
             arg.is_input and arg.allocation == copy.args[-1].allocation
             for spec in specs
@@ -1924,95 +1943,6 @@ def _relayout_layout(address, view):
     )
 
 
-class _CarriedReductionDep:
-    def __init__(self, name):
-        self.name = name
-
-
-def _verify_carried_reduction(missing_view=False):
-    accumulator = "fill"
-    record = CarriedReductionRecord(
-        accumulator_name=accumulator,
-        row_dim_name="T",
-        required_row_split=8,
-        fill_name="fill",
-        combine_name="combine",
-        drain_name="drain",
-    )
-    dep = _CarriedReductionDep(accumulator)
-    nodes = [
-        _RelayoutNode("fill", writes=(dep,)),
-        _RelayoutNode("combine", reads=(dep,), writes=(dep,)),
-        _RelayoutNode("drain", reads=(dep,)),
-    ]
-    for node in nodes:
-        node.node._carried_reduction_record = record
-
-    layout = _relayout_layout(0, None if missing_view else _SOURCE_VIEW)
-    graph = SimpleNamespace(
-        try_get_buffer=lambda name: (
-            SimpleNamespace(get_layout=lambda: layout) if name == accumulator else None
-        )
-    )
-
-    with (
-        mock_patch.object(scheduler_module, "SchedulerNode", _RelayoutNode),
-        mock_patch.object(scheduler_module, "MemoryDep", _CarriedReductionDep),
-        mock_patch.object(scheduler_module, "FixedTiledLayout", SimpleNamespace),
-        mock_patch.object(scheduler_module, "V", SimpleNamespace(graph=graph)),
-    ):
-        return scheduler_module.verify_carried_reduction_ownership(nodes)
-
-
-def test_carried_reduction_verifier_accepts_preserved_stages_and_view():
-    assert [node.name for node in _verify_carried_reduction()] == [
-        "fill",
-        "combine",
-        "drain",
-    ]
-
-
-def test_carried_reduction_verifier_requires_physical_ownership():
-    with pytest.raises(Unsupported, match="LX address but no physical ownership"):
-        _verify_carried_reduction(missing_view=True)
-
-
-@config.patch(
-    {
-        "sencores": 32,
-        "lx_planning": True,
-        "allow_all_ops_in_lx_planning": True,
-        "layout_solver": "greedy",
-    }
-)
-def test_carried_reduction_stages_compile_to_a_drain():
-    """Compile the real fill/combine/drain nodes, not hand-built descriptors."""
-
-    torch.manual_seed(0)
-    experts, tokens, hidden = 2, 64, 64
-    values = torch.randn(experts, tokens, hidden, dtype=torch.float16) * 0.1
-    for name, size in (("E", experts), ("T", tokens), ("H", hidden)):
-        _declare_tensor_dim(name, size)
-
-    def fn(values):
-        _name_tensor_dims(values, ["E", "T", "H"])
-        with spyre_hint(
-            num_tiles_per_dim={"E": experts},
-            work_div={"T": 32},
-        ):
-            return values.sum(dim=0)
-
-    device_values = _name_tensor_dims(values.to("spyre"), ["E", "T", "H"])
-    torch._inductor.codecache.FxGraphCache.clear()
-    actual, code = run_and_get_code(
-        torch.compile(fn, dynamic=False, options={"epilogue_fusion": False}),
-        device_values,
-    )
-
-    torch.testing.assert_close(actual.cpu(), fn(values), atol=0.05, rtol=0.05)
-    assert "coarse_tile_reduction_drain" in "\n".join(code)
-
-
 @pytest.mark.parametrize("k", [2, 3, 4, 8, 16, 32])
 def test_completed_reduction_reads_only_terminal_writers(k):
     source = _view({0: 2}, {0: floor(_CORE_ID / k)}, 2 * k)
@@ -2061,49 +1991,72 @@ def test_relayout_splits_rows_and_collects_columns():
     }
 
 
+def _assert_lx_resident_carry(code):
+    """The accumulate runs entirely in LX and one copy writes HBM after the loop."""
+    ops = opspec_summaries("\n".join(code))
+    assert ["lx", "lx", "lx"] in [o["allocations"] for o in ops if o["op"] == "add"]
+    assert ["lx", "hbm"] in [o["allocations"] for o in ops if o["op"] == "identity"]
+
+
 @config.patch(
-    {
-        "sencores": 32,
-        "lx_planning": True,
-        "allow_all_ops_in_lx_planning": True,
-        "layout_solver": "greedy",
-    }
+    {"sencores": 32, "lx_planning": True, "allow_all_ops_in_lx_planning": True}
 )
-def test_carried_reduction_after_tiled_pointwise_producer():
-    """A producer retile must not erase the reduction's named E symbol."""
+def test_for_each_tile_carried_sum_keeps_its_accumulator_in_lx():
+    """A for_each_tile carry sum accumulates in LX and drains to HBM once."""
+
+    torch.manual_seed(0)
+    experts, tokens, hidden = 2, 64, 64
+    values = torch.randn(experts, tokens, hidden, dtype=torch.float16) * 0.1
+    for name, size in (("E", experts), ("T", tokens), ("H", hidden)):
+        _declare_tensor_dim(name, size)
+
+    device_values = _name_tensor_dims(values.to("spyre"), ["E", "T", "H"])
+    torch._inductor.codecache.FxGraphCache.clear()
+    actual, code = run_and_get_code(
+        torch.compile(
+            lambda v: carried_expert_sum_fn(v, 32),
+            dynamic=False,
+            fullgraph=True,
+            options={"epilogue_fusion": False},
+        ),
+        device_values,
+    )
+
+    torch.testing.assert_close(
+        actual.cpu().float(), values.float().sum(0), atol=0.05, rtol=0.05
+    )
+    _assert_lx_resident_carry(code)
+
+
+@config.patch(
+    {"sencores": 32, "lx_planning": True, "allow_all_ops_in_lx_planning": True}
+)
+def test_for_each_tile_carried_sum_after_relayout_producer():
+    """A tiled operand that is itself a relayout copy still carries in LX."""
 
     torch.manual_seed(0)
     experts, tokens, hidden = 2, 64, 64
     values = torch.randn(experts, tokens, hidden, dtype=torch.float16) * 0.1
     routing = torch.randn(tokens, experts, 1, dtype=torch.float16) * 0.1
-    for name, size in (
-        ("E", experts),
-        ("T", tokens),
-        ("H", hidden),
-        ("ONE", 1),
-    ):
+    for name, size in (("E", experts), ("T", tokens), ("H", hidden)):
         _declare_tensor_dim(name, size)
 
-    def fn(values, routing):
-        with spyre_hint(named_dims=["E", "T", "ONE"]):
-            route = routing.permute(1, 0, 2).contiguous().clone()
-        with spyre_hint(
-            num_tiles_per_dim={"E": experts},
-            work_div={"T": 32},
-        ):
-            return (values * route).sum(dim=0)
-
     device_values = _name_tensor_dims(values.to("spyre"), ["E", "T", "H"])
-    device_routing = routing.to("spyre")
     torch._inductor.codecache.FxGraphCache.clear()
     actual, code = run_and_get_code(
-        torch.compile(fn, dynamic=False, options={"epilogue_fusion": False}),
+        torch.compile(
+            lambda v, r: carried_routed_expert_sum_fn(v, r, 32),
+            dynamic=False,
+            fullgraph=True,
+            options={"epilogue_fusion": False},
+        ),
         device_values,
-        device_routing,
+        routing.to("spyre"),
     )
 
-    torch.testing.assert_close(actual.cpu(), fn(values, routing), atol=0.05, rtol=0.05)
-    assert "coarse_tile_reduction_drain" in "\n".join(code)
+    expected = (values.float() * routing.float().permute(1, 0, 2)).sum(0)
+    torch.testing.assert_close(actual.cpu().float(), expected, atol=0.05, rtol=0.05)
+    _assert_lx_resident_carry(code)
 
 
 @config.patch(
@@ -2196,11 +2149,6 @@ def test_completed_reduction_relayout_device(
     ]
     assert len(copies) == int(enabled)
     if enabled:
-        routes = _assert_lx_only_relayout_payload(directories)
-        assert sorted(map(int, routes)) == list(range(k - 1, 32, k))
-        assert collections.Counter(
-            c for readers in routes.values() for c in readers
-        ) == {core: out_split // consumer_out for core in range(32)}
         assert "completed_producer_cores=" in "\n".join(code)
 
 

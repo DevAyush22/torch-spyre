@@ -898,6 +898,7 @@ class TestFfdcAsyncCompile:
         """Stub inductor/extension imports and return ``(mod, out_dir)``."""
         import logging
         import sys
+        import torch
 
         out_dir = str(tmp_path / "bundle")
 
@@ -960,9 +961,12 @@ class TestFfdcAsyncCompile:
             "torch_spyre.execution.kernel_runner",
             SpyreSDSCKernelRunner=_Runner,
             SpyreUnimplementedRunner=object,
+            SpyreFrontendOnlyRunner=object,
         )
 
         mod = _reimport(monkeypatch, "torch_spyre.execution.async_compile")
+        # Run the process-local compiler and FFDC mocks inline.
+        monkeypatch.setattr(torch._inductor.config, "compile_threads", 1)
         monkeypatch.setattr(mod, "get_output_dir", lambda name: out_dir)
         monkeypatch.setattr(mod, "generate_bundle", lambda *a, **k: [])
         monkeypatch.setattr(mod, "find_unimplemented", lambda specs: None)
