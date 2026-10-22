@@ -1834,25 +1834,28 @@ def lower_constant_pad_nd(
     return output
 
 
-def _trunc(x):
-    """Truncate a float32 tensor, as a cast to an integer dtype does.
+@register_spyre_lowering(torch.ops.aten.trunc.default)
+def lower_trunc(x):
+    """Truncate toward zero, for torch.trunc and a float32 -> int cast.
 
-    The device converts float32 to int32 with floor, but a cast truncates
-    (C-style, like rounding_mode="trunc"), so a float32 -> int cast truncates
-    first; the conversion of the integer-valued result is then exact.
-    clip(x, -1, 1) is the sign of x wherever floor(|x|) is nonzero, so the product
-    needs no compare or select, which split_multi_ops cannot replay in a fused body.
+    The device has no trunc op, so this computes floor(|x|) * clip(x, -1, 1),
+    with no compare or select. A negative fraction gives 0.0 rather than -0.0,
+    since the device multiply makes no negative zero. Integers and bools are
+    returned as is.
 
-    The result is realized with an origin of its own. The product reads x twice,
-    and as the last op of its own body it may: split_multi_ops refuses only an
-    intermediate that combines a view load with another operand, so fused into
-    the conversion it would refuse a source read through a view.
+    The clip is Spyre's single clip op (lower_clamp). It and the product are
+    realized with origins of their own, so split_multi_ops can split the bodies
+    that read them: the product reads x twice, which split_multi_ops allows over
+    a view only as a body's last op.
     """
-    result = lowering.mul(lowering.floor(lowering.abs(x)), lowering.clamp(x, -1.0, 1.0))
+    if not x.get_dtype().is_floating_point:
+        return x
     origin = x.get_origin_node() if isinstance(x, ir.IRNode) else None
-    _ensure_synthetic_origin(
-        result, torch.ops.aten.trunc.default, () if origin is None else (origin,)
-    )
+    origin_args = () if origin is None else (origin,)
+    sign = lower_clamp(x, -1.0, 1.0)
+    _ensure_synthetic_origin(sign, torch.ops.aten.clamp.default, origin_args)
+    result = lowering.mul(lowering.floor(lowering.abs(x)), sign)
+    _ensure_synthetic_origin(result, torch.ops.aten.trunc.default, origin_args)
     return result
 
 
@@ -1876,11 +1879,26 @@ def to_dtype(x, dst_dtype, use_compute_types=True, *, skip_trunc=False):
     if src_dtype == dst_dtype:
         return lowering.clone(x)
 
-    # No bool format has an op to an integer, but float32 has one, and a bool's
-    # 0/1 values convert exactly through it.
-    if src_dtype == torch.bool and dst_dtype in (torch.int32, torch.int64):
+    integer = (torch.int32, torch.int64)
+    float16_format = (torch.float16, torch.bfloat16)
+
+    # Only float32 has an op to an integer, so a float16-format source (float16,
+    # bfloat16, or a bool stored as either) converts through it. A bool's 0/1
+    # values need no trunc.
+    if src_dtype in (torch.bool, *float16_format) and dst_dtype in integer:
+        skip_trunc = skip_trunc or src_dtype == torch.bool
         as_float = to_dtype(x, torch.float32, use_compute_types)
-        return to_dtype(as_float, dst_dtype, use_compute_types, skip_trunc=True)
+        return to_dtype(as_float, dst_dtype, use_compute_types, skip_trunc=skip_trunc)
+
+    # Likewise an integer has an op only to float32, which then converts to the
+    # float16 format.
+    if src_dtype in integer and dst_dtype in float16_format:
+        as_float = to_dtype(x, torch.float32, use_compute_types)
+        return to_dtype(as_float, dst_dtype, use_compute_types)
+
+    # A cast to bool tests against zero rather than converting a value.
+    if src_dtype in integer and dst_dtype == torch.bool:
+        return lower_ne_scalar(x, 0)
 
     # Check if conversion is supported by backend
     if not DtypeOpTable.is_supported(src_dtype, dst_dtype):
@@ -1893,7 +1911,7 @@ def to_dtype(x, dst_dtype, use_compute_types=True, *, skip_trunc=False):
         and dst_dtype in (torch.int32, torch.int64)
         and not skip_trunc
     ):
-        x = _trunc(x)
+        x = lower_trunc(x)
 
     # Do not realize the result or stamp an origin on it here. split_multi_ops
     # materializes a fused conversion over its source buffer; realizing it here
@@ -2212,10 +2230,9 @@ def _cmp_operand_dtype(tensors):
       Both branches are expect_fail in the tests.
     * int32 -> fp32 (int32tofp32) keeps the element byte size, so the EA is
       unchanged and the comparison runs entirely on device.
-    * int32/int64 -> fp16 is not in DtypeOpTable at all, so ``to_dtype`` falls
-      back to a host cast. Those pairs produce the right answer and raise no EA
-      question -- no stick reordering is emitted -- but at the cost of a D2H/H2D
-      round-trip, and the fallback is only visible as a FallbackWarning.
+    * int32/int64 -> fp16 converts through fp32, and its fp32todl16 step makes
+      the operand staggered, so it meets the STANDARD fp16 operand exactly as in
+      the fp16 <-> fp32 case above.
 
     All-``torch.bool`` operands are returned unchanged, deliberately diverging
     from torch (which would promote them to fp32). A device bool is already stored
