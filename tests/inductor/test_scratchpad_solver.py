@@ -32,8 +32,10 @@ from torch_spyre._inductor import config
 from torch_spyre._inductor.scratchpad.allocator import (
     CoOptimizingAllocator,
     ScratchpadAllocator,
+    _coarse_tile_loop_trip_count,
     _lx_planning_size,
 )
+from torch_spyre._inductor.loop_info import CoarseTileInfo
 from torch_spyre._inductor.scratchpad.plan_solver import (
     BufferType,
     CoreDivisionLayoutSolver,
@@ -51,13 +53,13 @@ from torch_spyre._inductor.scratchpad.exhaustive_search import ExhaustiveSearchS
 try:
     from ortools.sat.python import cp_model  # noqa: F401
 
-    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
+    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import (
         _CORE_INV_SCALE,
         _MAX_PRODUCT_BOUND,
-        CpSatLayoutSolver,
         _SympyExprToCpSat,
         _simplify_eq_conjunction,
     )
+    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolver
 
     _HAS_ORTOOLS = True
 except ImportError:
@@ -148,6 +150,69 @@ class TestExhaustiveSearchResidency(TestCase):
         self.assertIsNotNone(result["consumer"].address)
         self.assertEqual(result["producer"].spill_reason, "core div mismatch")
 
+    @staticmethod
+    def _four_output_cores():
+        return CoreDivision(splits={sympy.Symbol("output"): 4})
+
+    @staticmethod
+    def _solve(buffers, lx_size):
+        solver = ExhaustiveSearchSolver.wrapping(GreedyLayoutSolver)(
+            buffers, size=lx_size, alignment=1
+        )
+        return {b.name: b for b in solver.plan_layout_and_core_divisions()}
+
+    def test_tiled_candidates_are_rejected(self):
+        """A tile-sized reservation is unsafe without matching graph tiling."""
+        buffer = CoreDivisionBuffer(
+            "buffer",
+            1024,
+            [0, 1],
+            core_divisions=[
+                CoreDivision(),
+                CoreDivision(tiling=TileSpec((TileAxis(host_dim=0, count=4),))),
+            ],
+        )
+        with self.assertRaisesRegex(ValueError, "requires untiled candidates"):
+            self._solve([buffer], lx_size=256)
+
+    def test_in_place_reuse_compares_per_core_sizes(self):
+        """In-place reuse compares the bytes that one core holds of each buffer."""
+        # In each case, the child starts at the last use of the parent. At that
+        # tick, both buffers are live.
+        with self.subTest("partitioned parent, whole child"):
+            parent = CoreDivisionBuffer(
+                "parent", 1024, [0, 1], core_divisions=[self._four_output_cores()]
+            )
+            child = CoreDivisionBuffer(
+                "child",
+                512,
+                [1, 2],
+                core_divisions=[CoreDivision()],
+                in_place_parents=["parent"],
+            )
+            # Each core holds 256 bytes of the parent. The 512-byte child
+            # cannot reuse that slot; both fit side by side in 768 bytes.
+            result = self._solve([parent, child], lx_size=768)
+            self.assertEqual(result["parent"].address, 0)
+            self.assertEqual(result["child"].address, 256)
+
+        with self.subTest("whole parent, partitioned child"):
+            parent = CoreDivisionBuffer(
+                "parent", 512, [0, 1], core_divisions=[CoreDivision()]
+            )
+            child = CoreDivisionBuffer(
+                "child",
+                1024,
+                [1, 2],
+                core_divisions=[self._four_output_cores()],
+                in_place_parents=["parent"],
+            )
+            # Each core holds 256 bytes of the child, which fits in the
+            # parent's 512-byte slot. LX is full, so the child must reuse it.
+            result = self._solve([parent, child], lx_size=512)
+            self.assertEqual(result["parent"].address, 0)
+            self.assertEqual(result["child"].address, 0)
+
 
 class TestAllocatorSpillReasons(TestCase):
     """The allocator reports spill reasons from the solved buffers alone."""
@@ -196,6 +261,51 @@ class TestLxPlanningContract(TestCase):
                         ValueError, "DXP_LX_FRAC_AVAIL must be >=0 and <=1"
                     ):
                         _lx_planning_size()
+
+
+class TestCoarseTileLoopTripCount(TestCase):
+    """_coarse_tile_loop_trip_count: the same-group relayout cost multiplier
+    (cyang49's PR #5057 review -- a same-group candidate's price must scale
+    by the loop's real trip count, not price one tile's worth as if it ran
+    once).
+    """
+
+    @staticmethod
+    def _tiled(loop_count):
+        return CoarseTileInfo(
+            loop_group_id=(0,) * len(loop_count),
+            loop_count=loop_count,
+            loop_tiled_dims=[[] for _ in loop_count],
+            loop_tiled_reduction_dims=[[] for _ in loop_count],
+        )
+
+    def test_untiled_op_is_one_trip(self):
+        op = types.SimpleNamespace(loop_info=None)
+        self.assertEqual(_coarse_tile_loop_trip_count(op), 1)
+
+    def test_single_level_concrete_count(self):
+        op = types.SimpleNamespace(loop_info=self._tiled([4]))
+        self.assertEqual(_coarse_tile_loop_trip_count(op), 4)
+
+    def test_nested_levels_multiply(self):
+        op = types.SimpleNamespace(loop_info=self._tiled([2, 4]))
+        self.assertEqual(_coarse_tile_loop_trip_count(op), 8)
+
+    def test_symbolic_trip_count_falls_back_to_one_instead_of_crashing(self):
+        """A dynamic-shape loop bound (for_each_tile_lowering.py's
+        _extract_trip_count) can stamp an unresolved sympy.Symbol into
+        loop_count instead of a concrete int. int() on that raises TypeError;
+        the multiplier must fall back to 1 for that level rather than
+        propagate a symbolic value into RelayoutCandidate.cost_ns (annotated
+        float, consumed by min()/round() elsewhere in the solver)."""
+        n = sympy.Symbol("n", positive=True, integer=True)
+        op = types.SimpleNamespace(loop_info=self._tiled([n]))
+        self.assertEqual(_coarse_tile_loop_trip_count(op), 1)
+
+    def test_symbolic_level_does_not_suppress_a_concrete_sibling_level(self):
+        n = sympy.Symbol("n", positive=True, integer=True)
+        op = types.SimpleNamespace(loop_info=self._tiled([n, 4]))
+        self.assertEqual(_coarse_tile_loop_trip_count(op), 4)
 
 
 class TestDrainLifetimeBoundary(TestCase):

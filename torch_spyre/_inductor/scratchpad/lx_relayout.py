@@ -45,9 +45,10 @@ from ..core_mapping import (
     select_unique_partition_division,
     transfer_edges,
 )
-from ..cost_model import OpFeatures, relayout_ns
+from ..cost_model import CostParams, OpFeatures, relayout_ns
 from ..dump_cost_model import governing_run_split
 from ..ir import FixedTiledLayout
+from ..loop_info import CoarseTileInfo
 from ..logging_utils import get_inductor_logger
 from ..op_spec import TensorWorkDivision
 from ..padding import is_restickify_op
@@ -72,6 +73,8 @@ _REGISTRY = "_spyre_lx_relayout_copies"
 # larger gather can fail register initialization even when individual cores
 # need fewer distinct values. Apply this conservative bound before placement.
 _MAX_SHUFFLE_FANIN = 8
+# Largest governing split the solver may be offered for a GROUPED movement.
+_GROUPED_SPLIT_MAX = 8
 
 
 @dataclasses.dataclass(frozen=True)
@@ -778,18 +781,35 @@ def solver_relayout_edge_context(
     loop-symbol -> extent mappings ``work_division_from_view`` projects into -
     or ``None`` when the edge can never host a relayout.
     """
-    # A coarse-tiled endpoint can never host a relayout. The fitted law has
-    # no loop_trip factor (the committed-path planner already guarantees "a
-    # relayout cannot be inside a coarse-tiling loop"), a tiled producer's
-    # buffer is per-tile scratch rather than the full tensor, and a tiled
-    # consumer reads cross-group data through a per-iteration staging op.
-    # The MutationLayout check below only screens the loop's DRAIN op; the
-    # staging and tiled compute ops are plain Pointwise buffers, so the
-    # loop_info presence is the reliable marker.
+    # A coarse-tiled endpoint can usually never host a relayout: a tiled
+    # consumer in general reads cross-group data through a per-iteration
+    # staging op a relayout can't account for. That doesn't apply when
+    # producer and consumer share the exact same loop_group_id -- same
+    # iteration, same tile, direct read, no staging op between them -- so
+    # that one case is let through, unless the consumer is already a
+    # restickify under read-copy-elision's own deferred direct-read handling
+    # (the same marker _distribute_work's division gate checks): that
+    # mechanism already owns this edge's placement, so relayout must not
+    # also offer a candidate for it. The fitted relayout law still prices
+    # one tile's worth; _cd_parent_relayouts (allocator.py) scales that by
+    # the parent's own loop trip count before handing a same-group candidate
+    # to the solver, so a repeated shuffle is priced at its real total cost,
+    # not once.
+    producer_loop_info = getattr(producer, "loop_info", None)
+    consumer_loop_info = getattr(consumer, "loop_info", None)
+    same_tile_group = (
+        config.lx_same_tile_group_relayout
+        and isinstance(producer_loop_info, CoarseTileInfo)
+        and isinstance(consumer_loop_info, CoarseTileInfo)
+        and producer_loop_info.loop_group_id == consumer_loop_info.loop_group_id
+        and not (
+            hasattr(consumer, "_read_copy_elision_record")
+            and is_restickify_op(consumer, graph)
+        )
+    )
     if (
-        getattr(producer, "loop_info", None) is not None
-        or getattr(consumer, "loop_info", None) is not None
-    ):
+        producer_loop_info is not None or consumer_loop_info is not None
+    ) and not same_tile_group:
         return None
     if (
         not isinstance(producer, ComputedBuffer)
@@ -846,41 +866,24 @@ def solver_relayout_pair_cost(
 ) -> float | None:
     """Price one candidate relayout (source view -> destination view), in ns.
 
-    ``None`` when the pair cannot host a relayout, or should not be offered:
+    Return ``None`` for matching ownership, unsupported movement, or a split
+    outside the measured range. Permutations use the cost model's split range;
+    grouped movements use [``relayout_split_min``, ``_GROUPED_SPLIT_MAX``].
+    The caller also applies the consumer's core-domain and gather rules.
 
-    - views with the same physical ownership need no relayout (that pair
-      belongs to ``cd_parent_matches``), compared with ``same_partition`` so a
-      differently spelled slot expression cannot masquerade as movement;
-    - ``movement_supported``, the committed path's own gate (#3440), admits
-      what the emitter can move: uniform permutations, grouped gathers and
-      grouped broadcasts, so the solver never prices a movement the emitter
-      cannot execute; the enumeration adds the collector's consumer rules
-      (:func:`core_domain_rejection`, :func:`grouped_gather_rejection`) on top. A
-      grouped movement is priced by the same law as a permutation of the same
-      tensor on the SOURCE's cores, keyed on the finer side's geometry as
-      always: ``cores=num_cores`` makes the law's per-core bytes the source
-      slice, which is what every destination core receives in a broadcast. The
-      grouped-relayout sweep (2026-09-09, 43 rows) measured the grouped
-      shuffle's marginal cost at or below that law (<= 0.3 us gathers, <= 1.6
-      us broadcasts, flat in fan-out), so this over-states, never under-states,
-      the shuffle; the decision is dominated by the consumer's replicated HBM
-      re-read on the demote side, priced by the cost model since #4454;
-    - a governing split outside the law's fitted range [2, 8] is DECLINED, not
-      clamped: the reporting path clamps because the shuffle it prices already
-      exists, but the solver must never be offered an option at a price the
-      law was not fitted for.
-
-    The price is ``relayout_ns`` on a minimal feature vector - the same function
-    the reporting path uses, so the two paths cannot drift.
-
-    Each view must be built FOR its own core count (every core's owner slot
-    within its split): the source for ``num_cores``, the destination for
-    ``destination_num_cores`` (the source's count when omitted). The caller's
-    cores_used gates guarantee that, and ``_core_slices`` asserts it rather
-    than tolerating an out-of-range slot.
+    Use the reporting path's ``relayout_ns`` with the source's core count and
+    the finer view's geometry. Build each view for its own core count:
+    ``num_cores`` for the source and ``destination_num_cores`` for the destination
+    (defaults to the source's count).
     """
     run_elems, split = governing_run_split(source_view, destination_view, device_dims)
-    if run_elems <= 0 or not 2 <= split <= 8:
+    p = params or CostParams()
+    permutation = (
+        destination_view.split_product == num_cores
+        and (destination_num_cores or num_cores) == num_cores
+    )
+    top = p.relayout_split_max if permutation else _GROUPED_SPLIT_MAX
+    if run_elems <= 0 or not p.relayout_split_min <= split <= top:
         return None
     if not movement_supported(
         source_view, destination_view, num_cores, destination_num_cores or num_cores
@@ -897,7 +900,7 @@ def solver_relayout_pair_cost(
         relayout_run_elems=run_elems,
         relayout_split=split,
     )
-    return relayout_ns(features, params)
+    return relayout_ns(features, p)
 
 
 def collect_lx_relayout_plans(
