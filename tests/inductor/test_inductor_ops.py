@@ -272,6 +272,9 @@ CUMSUM_PARAM_SETS = {
     ),
     # 0-D: no dim to scan, so CPU fallback
     "0d": (0, cached_randn(())),
+    # Empty: nothing to scan, so CPU fallback
+    "empty_2d_dim_1": (1, cached_randn((4, 0))),
+    "empty_3d_dim_1": (1, cached_randn((2, 0, 64))),
     # 2-D
     "2d_dim_0": (0, cached_randn((67, 256))),
     "2d_dim_0_n1": (0, cached_randn((1, 256))),  # n=1 edge case: identity cumsum
@@ -322,6 +325,7 @@ CUMSUM_PARAM_SETS = {
     # bf16, n not a stick multiple
     "pad_2d_dim_1_bf16": (1, cached_randn((63, 129), dtype=torch.bfloat16)),
     "pad_3d_dim_2_bf16": (2, cached_randn((3, 7, 9), dtype=torch.bfloat16)),
+    "empty_2d_dim_1_bf16": (1, cached_randn((4, 0), dtype=torch.bfloat16)),
     # -----------------------------------------------------------------------
     # fp32
     # 2-D
@@ -352,7 +356,7 @@ CUMSUM_PARAM_SETS = {
     "pad_3d_dim_1_fp32": (1, cached_randn((3, 7, 17), dtype=torch.float32)),
     "pad_3d_dim_2_fp32": (2, cached_randn((3, 7, 17), dtype=torch.float32)),
     # -----------------------------------------------------------------------
-    # int32 (torch.cumsum returns int64, so these fall back to CPU)
+    # int32 (accumulates in int64; int32 -> int64 converts on Spyre)
     "2d_dim_0_int32": (0, cached_randint((9, 64))),
     "2d_dim_1_int32": (1, cached_randint((4, 64))),
     "2d_dim_neg1_int32": (-1, cached_randint((4, 32))),
@@ -8651,6 +8655,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ("test_cumsum_dtype", "test_cumsum_dtype_cpu"): {
             "param_sets": {
                 "2d_int32_to_int32": (1, torch.int32, cached_randint((4, 64)), True),
+                "2d_int32_to_int64": (1, torch.int64, cached_randint((4, 64)), True),
                 "2d_dim_0_int64_to_fp32": (
                     0,
                     torch.float32,
@@ -8670,12 +8675,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randint((9, 64), high=8).to(torch.float16),
                     True,
                 ),
-                # No int64 -> int32 conversion op: CPU fallback.
                 "1d_int64_to_int32": (
                     0,
                     torch.int32,
                     cached_randint((8,), dtype=torch.int64),
-                    False,
+                    True,
                 ),
                 # 16 -> 32 bit conversion: CPU fallback.
                 "2d_dim_0_fp16_to_fp32": (
@@ -9802,6 +9806,63 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             str(w.message) for w in captured if issubclass(w.category, FallbackWarning)
         ]
         assert not any("cumsum_cpu_fallback" in m for m in fallbacks), fallbacks
+
+    def test_cumsum_out(self):
+        exact = {"atol": 0, "rtol": 0}
+        for x, tol in (
+            (cached_randn((4, 64)), {}),
+            (cached_randint((4, 64), dtype=torch.int64), exact),
+        ):
+
+            def fn(t):
+                out = torch.empty(t.shape, dtype=t.dtype, device=t.device)
+                torch.cumsum(t, 1, out=out)
+                return out
+
+            self.compare_with_cpu(fn, x, **tol)
+
+        def fn_view(t):
+            # out= a view: only its rows change.
+            base = torch.zeros(8, 64, dtype=t.dtype, device=t.device)
+            torch.cumsum(t, 1, out=base[4:])
+            return base
+
+        self.compare_with_cpu(fn_view, cached_randn((4, 64)), run_compile=False)
+
+    def test_cumsum_inplace(self):
+        # Clone first so the cached input is not mutated.
+        exact = {"atol": 0, "rtol": 0}
+        for x, dim, tol in (
+            (cached_randn((4, 64)), 1, {}),
+            (cached_randint((4, 64), dtype=torch.int64), 1, exact),
+            (cached_randn((4, 3, 64)), 0, {}),
+        ):
+
+            def fn(t, dim=dim):
+                y = t.clone()
+                y.cumsum_(dim)
+                return y
+
+            self.compare_with_cpu(fn, x, **tol)
+
+        def fn_view(t):
+            # In place on a view: only its rows change.
+            y = t.clone()
+            y[2:6].cumsum_(1)
+            return y
+
+        self.compare_with_cpu(fn_view, cached_randn((8, 64)), run_compile=False)
+
+    @expects_raise
+    def test_cumsum_dim_out_of_range_rejected(self):
+        # Like torch.cumsum on CPU, a dim outside [-ndim, ndim - 1] raises, in
+        # eager and compiled mode.
+        x = cached_randn((4, 64)).to(utils_inductor.DEVICE)
+        for dim in (2, -3):
+            with pytest.raises(IndexError, match="Dimension out of range"):
+                torch.cumsum(x, dim)
+            with pytest.raises(IndexError, match="Dimension out of range"):
+                torch.compile(lambda t, d=dim: torch.cumsum(t, d))(x)
 
     def _get_core_reduction_invalid_dim_cases(self):
         x = cached_randn((3, 5, 64))

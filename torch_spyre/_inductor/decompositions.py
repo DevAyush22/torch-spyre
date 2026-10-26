@@ -32,7 +32,11 @@ from typing import Any, Callable, Optional, Sequence, Union
 
 import torch
 import torch._decomp as decomp
-from torch._prims_common import ELEMENTWISE_TYPE_PROMOTION_KIND, elementwise_dtypes
+from torch._prims_common import (
+    ELEMENTWISE_TYPE_PROMOTION_KIND,
+    canonicalize_dim,
+    elementwise_dtypes,
+)
 
 from .constants import DEVICE_NAME, FP8_E4M3FN_MAX, FP8_E4M3FN_MIN
 from .dtype_ops import DtypeOpTable
@@ -3064,8 +3068,8 @@ def bitwise_and(input1: torch.Tensor, input2: torch.Tensor) -> torch.Tensor:
 # Spyre has no native scan op (issue #3388), so cumsum is decomposed as:
 #
 #   Inputs that need a width-changing or unsupported dtype conversion (e.g.
-#   bool and int32, which accumulate in int64) fall back to CPU and do not
-#   reach the steps below.
+#   bool, which accumulates in int64) fall back to CPU and do not reach the
+#   steps below.
 #
 #   1. reshape_and_pad_via_cpu  — reshape to (A, n, B) and zero-pad to
 #      (A_scan, n_scan, B_scan) on CPU (avoids issue #3916), then convert to
@@ -3076,6 +3080,9 @@ def bitwise_and(input1: torch.Tensor, input2: torch.Tensor) -> torch.Tensor:
 #      - fp32 / int32 / int64: parallel prefix scan on dim=1 of
 #        (A_scan, n_scan, B_scan).
 #   3. slice_and_reshape_via_cpu  — remove padding and restore original shape on CPU.
+#   Known limits: a staggered input (e.g. an in-graph fp16 -> fp32 cast) scanned
+#   along the stick dim gives wrong values, and integer sums past 2**31 wrap
+#   (int64 is 32-bit on Spyre).
 #   TODO: steps 1 and 3 can be replaced with inline ops once #3916 is fixed.
 
 # Result dtypes with an on-device scan.
@@ -3108,12 +3115,13 @@ def spyre_cumsum(
             and get_elem_in_stick(x.dtype) == get_elem_in_stick(dtype)
         )
     )
-    # A 0-d input has no dim to scan.
-    if not on_device or x.dim() == 0:
+    # Raise IndexError like torch.cumsum; eager reaches this decomposition
+    # without the op's own dim check.
+    dim = canonicalize_dim(x.dim(), dim)
+    # A 0-d input has no dim to scan; an empty one has nothing to scan.
+    if not on_device or x.dim() == 0 or x.numel() == 0:
         return torch.ops.spyre.cumsum_cpu_fallback(x, dim, dtype)
 
-    ndim = x.dim()
-    dim = dim % ndim  # normalise negative dim
     n = x.shape[dim]
     _STICK = get_elem_in_stick(dtype)
 
